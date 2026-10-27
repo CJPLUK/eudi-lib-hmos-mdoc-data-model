@@ -1,0 +1,921 @@
+/*
+ * mdoc_response_test.cj
+ *
+ * Unit tests for mdoc_response feature — fc_mdoc_response_model.
+ *
+ * done_when 1: DeviceResponse/Document/IssuerNameSpaces/IssuerSignedItem CBOR
+ *              round-trip (含 random/digestID/elementValue, ISO 18013-5 §8.3)
+ * done_when 2: DeviceSigned/DeviceAuth 容器解析正确
+ * done_when 3: IssuerSignedItem 的 digest 计算输入 (Tag24 包装字节) 与 ISO 规范一致
+ *              — 构造 IssuerSignedItem → Tag24 字节 → Digest.sha256 → 放进 ValueDigests
+ *              → 按 digestID 取出比对
+ */
+package ohos_app_cangjie_eudi_cjmdoc_data_model_local_test
+
+import std.unittest.*
+import std.unittest.testmacro.*
+import std.collection.ArrayList
+import std.collection.HashMap
+
+import ohos_app_cangjie_eudi_cjcbor.cbor.CborValue
+import ohos_app_cangjie_eudi_cjcbor.cbor.CborTag
+import ohos_app_cangjie_eudi_cjcbor.cbor.decodeCbor
+import ohos_app_cangjie_eudi_cjcbor.cbor.encodeEmbedded
+
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.core.MdocValidationError
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.core.VerifyAlgorithm
+
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.issuerauth.DigestAlgorithmKind
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.issuerauth.DigestIDs
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.issuerauth.ValueDigests
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.issuerauth.ValidityInfo
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.issuerauth.DeviceKeyInfo
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.issuerauth.MobileSecurityObject
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.issuerauth.IssuerAuth
+
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.response.DocDataValue
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.response.cborToDocDataValue
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.response.IssuerSignedItem
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.response.IssuerNameSpaces
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.response.IssuerSigned
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.response.DeviceSignedItems
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.response.DeviceNameSpaces
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.response.DeviceAuth
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.response.DeviceSigned
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.response.MdocErrors
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.response.DocumentError
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.response.Document
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.response.DeviceResponse
+
+import eudi_lib_core_crypto.Digest
+
+/* ------------------------------------------------------------------ */
+/* Test helpers                                                        */
+/* ------------------------------------------------------------------ */
+
+func bytesEqualResp(a: Array<UInt8>, b: Array<UInt8>): Bool {
+    if (a.size != b.size) {
+        return false
+    }
+    var i = 0
+    while (i < a.size) {
+        if (a[i] != b[i]) {
+            return false
+        }
+        i++
+    }
+    return true
+}
+
+/**
+ * Build a minimal MobileSecurityObject for use in Document tests.
+ * Matches buildTestMso() from mdoc_issuerauth_test but with a digest map
+ * that will be filled in by the digest-verification test.
+ */
+func buildMsoForResponse(vd: ValueDigests): MobileSecurityObject {
+    let vi = ValidityInfo(
+        "2024-01-01T00:00:00Z",
+        "2024-01-01T00:00:00Z",
+        "2025-01-01T00:00:00Z",
+        None
+    )
+    let dkPairs = ArrayList<(CborValue, CborValue)>()
+    dkPairs.add((CborValue.UInt64Val(1), CborValue.UInt64Val(2)))
+    dkPairs.add((CborValue.NInt64Val(0), CborValue.UInt64Val(1)))
+    let dkCbor = CborValue.MapVal(dkPairs)
+    let dki = DeviceKeyInfo(dkCbor, None, None)
+    return MobileSecurityObject(
+        MobileSecurityObject.DEFAULT_VERSION,
+        DigestAlgorithmKind.Sha256.stringValue(),
+        vd,
+        dki,
+        "org.iso.18013.5.1.mDL",
+        vi
+    )
+}
+
+/**
+ * Build a minimal IssuerAuth with a given MSO and fake signature/cert.
+ */
+func buildIssuerAuth(mso: MobileSecurityObject): IssuerAuth {
+    let msoBytes = mso.toTag24Bytes()
+    let fakeSig: Array<UInt8> = [0xDE, 0xAD, 0xBE, 0xEF]
+    let fakeCert: Array<UInt8> = [0x30, 0x82]
+    let x5chainList = ArrayList<Array<UInt8>>()
+    x5chainList.add(fakeCert)
+    return IssuerAuth(
+        mso,
+        msoBytes,
+        VerifyAlgorithm.Es256.coseValue(),
+        fakeSig,
+        x5chainList,
+        None
+    )
+}
+
+/**
+ * Build a minimal DeviceSigned with a COSE_Sign1 deviceSignature.
+ * nameSpaces is empty (valid per spec).
+ */
+func buildDeviceSigned(): DeviceSigned {
+    let emptyNs = ArrayList<(String, DeviceSignedItems)>()
+    let ns = DeviceNameSpaces(emptyNs)
+
+    let coseItems = ArrayList<CborValue>()
+    let phPairs = ArrayList<(CborValue, CborValue)>()
+    phPairs.add((CborValue.UInt64Val(UInt64(1)), CborValue.NInt64Val(UInt64(6))))
+    let phBytes = CborValue.MapVal(phPairs).encode()
+    coseItems.add(CborValue.ByteStringVal(phBytes))
+    let uphPairs = ArrayList<(CborValue, CborValue)>()
+    coseItems.add(CborValue.MapVal(uphPairs))
+    coseItems.add(CborValue.ByteStringVal([0x01, 0x02]))
+    coseItems.add(CborValue.ByteStringVal([0xAB, 0xCD]))
+    let coseCbor = CborValue.TaggedVal(CborTag.COSE_SIGN1, CborValue.ArrayVal(coseItems))
+
+    let da = DeviceAuth(true, coseCbor)
+    return DeviceSigned(ns, da)
+}
+
+/* ================================================================== */
+/* Test class 1 — done_when 1: IssuerSignedItem round-trip            */
+/* ================================================================== */
+
+@Test
+public class IssuerSignedItemTest {
+
+    /**
+     * Round-trip: encode IssuerSignedItem → bytes → Tag-24-wrap → decode via
+     * fromCborBytes → verify all fields and rawData preserved.
+     */
+    @TestCase
+    func issuerSignedItemRoundTrip(): Unit {
+        let item = IssuerSignedItem(
+            UInt64(0),
+            [0xAA, 0xBB, 0xCC, 0xDD],
+            "family_name",
+            CborValue.TextStringVal("Mustermann"),
+            None
+        )
+        let itemBytes = item.encode()
+        let decoded = IssuerSignedItem.fromCborBytes(itemBytes)
+
+        @Assert(decoded.digestID, UInt64(0))
+        @Assert(decoded.elementIdentifier, "family_name")
+        @Assert(bytesEqualResp(decoded.random, [0xAA, 0xBB, 0xCC, 0xDD]))
+        match (decoded.elementValue) {
+            case CborValue.TextStringVal(s) => @Assert(s, "Mustermann")
+            case _ => @Assert(false)
+        }
+    }
+
+    /**
+     * rawData preservation: after fromCborBytes, encode() returns the same bytes.
+     */
+    @TestCase
+    func issuerSignedItemRawDataPreserved(): Unit {
+        let item = IssuerSignedItem(
+            UInt64(1),
+            [0x01, 0x02],
+            "given_name",
+            CborValue.TextStringVal("Erika"),
+            None
+        )
+        let originalBytes = item.encode()
+        let decoded = IssuerSignedItem.fromCborBytes(originalBytes)
+        let encodedAgain = decoded.encode()
+
+        @Assert(bytesEqualResp(encodedAgain, originalBytes))
+    }
+
+    /**
+     * IssuerSignedItem with integer elementValue round-trips.
+     */
+    @TestCase
+    func issuerSignedItemIntegerValue(): Unit {
+        let item = IssuerSignedItem(
+            UInt64(2),
+            [0x11],
+            "age",
+            CborValue.UInt64Val(UInt64(25)),
+            None
+        )
+        let bytes = item.encode()
+        let decoded = IssuerSignedItem.fromCborBytes(bytes)
+
+        @Assert(decoded.digestID, UInt64(2))
+        @Assert(decoded.elementIdentifier, "age")
+        match (decoded.elementValue) {
+            case CborValue.UInt64Val(n) => @Assert(n, UInt64(25))
+            case _ => @Assert(false)
+        }
+    }
+
+    /**
+     * IssuerSignedItem with bytes elementValue round-trips.
+     */
+    @TestCase
+    func issuerSignedItemBytesValue(): Unit {
+        let portrait: Array<UInt8> = [0xFF, 0xD8, 0xFF, 0xE0]
+        let item = IssuerSignedItem(
+            UInt64(3),
+            [0x22, 0x33],
+            "portrait",
+            CborValue.ByteStringVal(portrait),
+            None
+        )
+        let bytes = item.encode()
+        let decoded = IssuerSignedItem.fromCborBytes(bytes)
+
+        match (decoded.elementValue) {
+            case CborValue.ByteStringVal(b) => @Assert(bytesEqualResp(b, portrait))
+            case _ => @Assert(false)
+        }
+    }
+
+    /**
+     * fromCbor with missing digestID throws.
+     */
+    @TestCase
+    func issuerSignedItemMissingDigestIdThrows(): Unit {
+        let pairs = ArrayList<(CborValue, CborValue)>()
+        pairs.add((CborValue.TextStringVal("random"), CborValue.ByteStringVal([0x01])))
+        pairs.add((CborValue.TextStringVal("elementIdentifier"), CborValue.TextStringVal("x")))
+        pairs.add((CborValue.TextStringVal("elementValue"), CborValue.TextStringVal("v")))
+        let malformed = CborValue.MapVal(pairs)
+        var threw = false
+        try {
+            let _ = IssuerSignedItem.fromCbor(malformed)
+        } catch (_: MdocValidationError) {
+            threw = true
+        }
+        @Assert(threw)
+    }
+}
+
+/* ================================================================== */
+/* Test class 2 — done_when 1: IssuerNameSpaces round-trip            */
+/* ================================================================== */
+
+@Test
+public class IssuerNameSpacesTest {
+
+    /**
+     * Round-trip: build IssuerNameSpaces, encode, decode, verify all items
+     * and their rawData survive the encoding/decoding cycle.
+     */
+    @TestCase
+    func issuerNameSpacesRoundTrip(): Unit {
+        let item1 = IssuerSignedItem(
+            UInt64(0),
+            [0x10, 0x20],
+            "family_name",
+            CborValue.TextStringVal("Doe"),
+            None
+        )
+        let item2 = IssuerSignedItem(
+            UInt64(1),
+            [0x30, 0x40],
+            "given_name",
+            CborValue.TextStringVal("John"),
+            None
+        )
+        let items = ArrayList<IssuerSignedItem>()
+        items.add(item1)
+        items.add(item2)
+
+        let nsMap = HashMap<String, ArrayList<IssuerSignedItem>>()
+        nsMap.add("org.iso.18013.5.1", items)
+
+        let ns = IssuerNameSpaces(nsMap)
+        let encoded = ns.toCbor()
+        let decoded = IssuerNameSpaces.fromCbor(encoded)
+
+        let itemsOpt = decoded.get("org.iso.18013.5.1")
+        match (itemsOpt) {
+            case None => @Assert(false)
+            case Some(decodedItems) =>
+                @Assert(decodedItems.size, Int64(2))
+                @Assert(decodedItems[0].elementIdentifier, "family_name")
+                @Assert(decodedItems[1].elementIdentifier, "given_name")
+        }
+    }
+
+    /**
+     * Verify that after IssuerNameSpaces round-trip, each item's rawData is
+     * non-None (set by fromCborBytes) and matches the re-encode.
+     */
+    @TestCase
+    func issuerNameSpacesItemsHaveRawData(): Unit {
+        let item = IssuerSignedItem(
+            UInt64(0),
+            [0xAA],
+            "document_number",
+            CborValue.TextStringVal("DL123456"),
+            None
+        )
+        let items = ArrayList<IssuerSignedItem>()
+        items.add(item)
+
+        let nsMap = HashMap<String, ArrayList<IssuerSignedItem>>()
+        nsMap.add("org.iso.18013.5.1", items)
+
+        let ns = IssuerNameSpaces(nsMap)
+        let decoded = IssuerNameSpaces.fromCbor(ns.toCbor())
+
+        let decodedItemsOpt = decoded.get("org.iso.18013.5.1")
+        match (decodedItemsOpt) {
+            case None => @Assert(false)
+            case Some(decodedItems) =>
+                let di = decodedItems[0]
+                match (di.rawData) {
+                    case None => @Assert(false)
+                    case Some(_) => @Assert(true)
+                }
+        }
+    }
+
+    /**
+     * Empty namespace array throws.
+     */
+    @TestCase
+    func issuerNameSpacesEmptyArrayThrows(): Unit {
+        let outerPairs = ArrayList<(CborValue, CborValue)>()
+        outerPairs.add((
+            CborValue.TextStringVal("org.iso.18013.5.1"),
+            CborValue.ArrayVal(ArrayList<CborValue>())
+        ))
+        var threw = false
+        try {
+            let _ = IssuerNameSpaces.fromCbor(CborValue.MapVal(outerPairs))
+        } catch (_: MdocValidationError) {
+            threw = true
+        }
+        @Assert(threw)
+    }
+}
+
+/* ================================================================== */
+/* Test class 3 — done_when 2: DeviceSigned / DeviceAuth round-trip   */
+/* ================================================================== */
+
+@Test
+public class DeviceSignedTest {
+
+    /**
+     * Round-trip: DeviceSigned with deviceSignature.
+     * Verifies DeviceAuth.isSign1 == true and coseCbor survives round-trip.
+     */
+    @TestCase
+    func deviceSignedRoundTripWithSignature(): Unit {
+        let ds = buildDeviceSigned()
+        let encoded = ds.toCbor()
+        let decoded = DeviceSigned.fromCbor(encoded)
+
+        @Assert(decoded.deviceAuth.isSign1)
+    }
+
+    /**
+     * Round-trip: DeviceSigned with deviceMac (COSE_Mac0, tag 17).
+     */
+    @TestCase
+    func deviceSignedRoundTripWithMac(): Unit {
+        let emptyNs = ArrayList<(String, DeviceSignedItems)>()
+        let ns = DeviceNameSpaces(emptyNs)
+
+        let macCbor = CborValue.TextStringVal("fake_mac_placeholder")
+        let da = DeviceAuth(false, macCbor)
+        let ds = DeviceSigned(ns, da)
+
+        let encoded = ds.toCbor()
+        let decoded = DeviceSigned.fromCbor(encoded)
+
+        @Assert(!decoded.deviceAuth.isSign1)
+    }
+
+    /**
+     * DeviceAuth: both deviceSignature and deviceMac present → throws.
+     */
+    @TestCase
+    func deviceAuthBothPresentThrows(): Unit {
+        let pairs = ArrayList<(CborValue, CborValue)>()
+        pairs.add((CborValue.TextStringVal("deviceSignature"), CborValue.TextStringVal("sig")))
+        pairs.add((CborValue.TextStringVal("deviceMac"), CborValue.TextStringVal("mac")))
+        var threw = false
+        try {
+            let _ = DeviceAuth.fromCbor(CborValue.MapVal(pairs))
+        } catch (_: MdocValidationError) {
+            threw = true
+        }
+        @Assert(threw)
+    }
+
+    /**
+     * DeviceAuth: neither deviceSignature nor deviceMac present → throws.
+     */
+    @TestCase
+    func deviceAuthNeitherPresentThrows(): Unit {
+        let pairs = ArrayList<(CborValue, CborValue)>()
+        var threw = false
+        try {
+            let _ = DeviceAuth.fromCbor(CborValue.MapVal(pairs))
+        } catch (_: MdocValidationError) {
+            threw = true
+        }
+        @Assert(threw)
+    }
+
+    /**
+     * DeviceSigned with non-empty DeviceNameSpaces round-trips correctly.
+     */
+    @TestCase
+    func deviceSignedWithNamespaceDataRoundTrip(): Unit {
+        let dsiPairs = ArrayList<(String, CborValue)>()
+        dsiPairs.add(("age_over_18", CborValue.BoolVal(true)))
+        let dsi = DeviceSignedItems(dsiPairs)
+
+        let nsItems = ArrayList<(String, DeviceSignedItems)>()
+        nsItems.add(("org.iso.18013.5.1", dsi))
+        let ns = DeviceNameSpaces(nsItems)
+
+        let da = DeviceAuth(true, CborValue.TextStringVal("fake"))
+        let ds = DeviceSigned(ns, da)
+        let encoded = ds.toCbor()
+        let decoded = DeviceSigned.fromCbor(encoded)
+
+        let nsOpt = decoded.nameSpaces.get("org.iso.18013.5.1")
+        match (nsOpt) {
+            case None => @Assert(false)
+            case Some(items) =>
+                let ageOpt = items.get("age_over_18")
+                match (ageOpt) {
+                    case Some(CborValue.BoolVal(b)) => @Assert(b)
+                    case _ => @Assert(false)
+                }
+        }
+    }
+}
+
+/* ================================================================== */
+/* Test class 4 — done_when 1: DeviceResponse full round-trip         */
+/* ================================================================== */
+
+@Test
+public class DeviceResponseTest {
+
+    /**
+     * Minimal DeviceResponse with no documents and status=0 round-trips.
+     */
+    @TestCase
+    func deviceResponseMinimalRoundTrip(): Unit {
+        let dr = DeviceResponse(DeviceResponse.DEFAULT_VERSION, None, None, UInt64(0))
+        let encoded = dr.toCbor()
+        let bytes = encoded.encode()
+        let decoded = DeviceResponse.fromCborBytes(bytes)
+
+        @Assert(decoded.version, DeviceResponse.DEFAULT_VERSION)
+        @Assert(decoded.status, UInt64(0))
+        match (decoded.documents) {
+            case None => @Assert(true)
+            case Some(_) => @Assert(false)
+        }
+    }
+
+    /**
+     * DeviceResponse with a Document round-trips: version, docType, status survive.
+     */
+    @TestCase
+    func deviceResponseWithDocumentRoundTrip(): Unit {
+        let item = IssuerSignedItem(
+            UInt64(0),
+            [0xFF, 0xEE],
+            "family_name",
+            CborValue.TextStringVal("Smith"),
+            None
+        )
+        let items = ArrayList<IssuerSignedItem>()
+        items.add(item)
+
+        let nsMap = HashMap<String, ArrayList<IssuerSignedItem>>()
+        nsMap.add("org.iso.18013.5.1", items)
+        let issuerNs = IssuerNameSpaces(nsMap)
+
+        let ns1Digests = HashMap<UInt64, Array<UInt8>>()
+        ns1Digests.add(UInt64(0), [0x11, 0x22])
+        let vdMap = HashMap<String, DigestIDs>()
+        vdMap.add("org.iso.18013.5.1", DigestIDs(ns1Digests))
+        let vd = ValueDigests(vdMap)
+
+        let mso = buildMsoForResponse(vd)
+        let ia = buildIssuerAuth(mso)
+
+        let issuerSigned = IssuerSigned(Some(issuerNs), ia)
+        let deviceSigned = buildDeviceSigned()
+
+        let doc = Document("org.iso.18013.5.1.mDL", issuerSigned, deviceSigned, None)
+        let docs = ArrayList<Document>()
+        docs.add(doc)
+
+        let dr = DeviceResponse(DeviceResponse.DEFAULT_VERSION, Some(docs), None, UInt64(0))
+        let bytes = dr.toCbor().encode()
+        let decoded = DeviceResponse.fromCborBytes(bytes)
+
+        @Assert(decoded.version, DeviceResponse.DEFAULT_VERSION)
+        @Assert(decoded.status, UInt64(0))
+        match (decoded.documents) {
+            case None => @Assert(false)
+            case Some(decodedDocs) =>
+                @Assert(decodedDocs.size, Int64(1))
+                @Assert(decodedDocs[0].docType, "org.iso.18013.5.1.mDL")
+        }
+    }
+
+    /**
+     * DeviceResponse with DocumentError round-trips.
+     */
+    @TestCase
+    func deviceResponseWithDocumentErrorRoundTrip(): Unit {
+        let deMap = HashMap<String, UInt64>()
+        deMap.add("org.iso.18013.5.1.mDL", UInt64(0))
+        let de = DocumentError(deMap)
+        let deList = ArrayList<DocumentError>()
+        deList.add(de)
+
+        let dr = DeviceResponse(DeviceResponse.DEFAULT_VERSION, None, Some(deList), UInt64(10))
+        let bytes = dr.toCbor().encode()
+        let decoded = DeviceResponse.fromCborBytes(bytes)
+
+        @Assert(decoded.status, UInt64(10))
+        match (decoded.documentErrors) {
+            case None => @Assert(false)
+            case Some(errors) =>
+                @Assert(errors.size, Int64(1))
+                let ecOpt = errors[0].get("org.iso.18013.5.1.mDL")
+                match (ecOpt) {
+                    case Some(ec) => @Assert(ec, UInt64(0))
+                    case None => @Assert(false)
+                }
+        }
+    }
+
+    /**
+     * DeviceResponse: empty documents array throws.
+     */
+    @TestCase
+    func deviceResponseEmptyDocumentsThrows(): Unit {
+        let pairs = ArrayList<(CborValue, CborValue)>()
+        pairs.add((CborValue.TextStringVal("version"), CborValue.TextStringVal("1.0")))
+        pairs.add((CborValue.TextStringVal("documents"), CborValue.ArrayVal(ArrayList<CborValue>())))
+        pairs.add((CborValue.TextStringVal("status"), CborValue.UInt64Val(UInt64(0))))
+        var threw = false
+        try {
+            let _ = DeviceResponse.fromCbor(CborValue.MapVal(pairs))
+        } catch (_: MdocValidationError) {
+            threw = true
+        }
+        @Assert(threw)
+    }
+}
+
+/* ================================================================== */
+/* Test class 5 — done_when 3: IssuerSignedItem digest verification   */
+/* ================================================================== */
+
+/**
+ * ISO 18013-5 §9.1.2 digest compliance test.
+ *
+ * The digest in ValueDigests is computed over the Tag-24-wrapped encoding of
+ * the IssuerSignedItem map.  The exact bytes are:
+ *   Tag-24(IssuerSignedItemBytes) = #6.24(bstr .cbor IssuerSignedItem)
+ *
+ * Issuer flow:
+ *   1. Construct IssuerSignedItem map
+ *   2. item_bytes = item.encode() (canonical CBOR of the map)
+ *   3. tag24_bytes = #6.24(bstr(item_bytes)) encoded to bytes
+ *   4. digest = SHA-256(tag24_bytes)
+ *   5. Store digest in MSO.ValueDigests[ns][digestID]
+ *
+ * Verifier flow (this test's flow):
+ *   1. Receive IssuerSignedItem; rawData = wire bytes of the map
+ *   2. tag24_bytes = encode(#6.24(bstr(rawData)))
+ *   3. digest_computed = SHA-256(tag24_bytes)
+ *   4. Assert digest_computed == ValueDigests[ns][digestID]
+ */
+@Test
+public class IssuerSignedItemDigestTest {
+
+    /**
+     * Construct IssuerSignedItem → compute Tag24 digest → store in ValueDigests
+     * → decode via IssuerNameSpaces → re-compute digest from rawData → compare.
+     *
+     * This is the critical compliance test for done_when 3.
+     */
+    @TestCase
+    func issuerSignedItemDigestMatchesValueDigests(): Unit {
+        let ns = "org.iso.18013.5.1"
+        let digestId: UInt64 = 0
+
+        // Step 1: construct item
+        let item = IssuerSignedItem(
+            digestId,
+            [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+             0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00],
+            "family_name",
+            CborValue.TextStringVal("Mustermann"),
+            None
+        )
+
+        // Step 2: item_bytes = canonical CBOR bytes of the map
+        let itemBytes = item.encode()
+
+        // Step 3: Tag24-wrap bytes = encode(#6.24(bstr(item_bytes)))
+        let tag24Cbor = CborValue.TaggedVal(CborTag.ENCODED_CBOR, CborValue.ByteStringVal(itemBytes))
+        let tag24Bytes = tag24Cbor.encode()
+
+        // Step 4: digest = SHA-256(tag24_bytes)
+        let digest = Digest.sha256(tag24Bytes)
+
+        // Step 5: build ValueDigests with this digest
+        let digestMap = HashMap<UInt64, Array<UInt8>>()
+        digestMap.add(digestId, digest)
+        let digestIds = DigestIDs(digestMap)
+        let vdMap = HashMap<String, DigestIDs>()
+        vdMap.add(ns, digestIds)
+        let vd = ValueDigests(vdMap)
+
+        // Step 6: encode IssuerNameSpaces (wraps items as Tag-24)
+        let items = ArrayList<IssuerSignedItem>()
+        items.add(item)
+        let nsMap = HashMap<String, ArrayList<IssuerSignedItem>>()
+        nsMap.add(ns, items)
+        let issuerNameSpaces = IssuerNameSpaces(nsMap)
+
+        // Step 7: decode IssuerNameSpaces (simulates receiver)
+        let decodedNs = IssuerNameSpaces.fromCbor(issuerNameSpaces.toCbor())
+
+        // Step 8: from decoded item, re-compute digest from rawData
+        let decodedItemsOpt = decodedNs.get(ns)
+        match (decodedItemsOpt) {
+            case None => @Assert(false)
+            case Some(decodedItems) =>
+                let decodedItem = decodedItems[0]
+
+                // rawData must be preserved
+                let rawDataOpt = decodedItem.rawData
+                match (rawDataOpt) {
+                    case None =>
+                        @Assert(false)
+                    case Some(rawData) =>
+                        // Re-wrap rawData in Tag-24 and compute digest
+                        let verifyTag24Cbor = CborValue.TaggedVal(
+                            CborTag.ENCODED_CBOR,
+                            CborValue.ByteStringVal(rawData)
+                        )
+                        let verifyTag24Bytes = verifyTag24Cbor.encode()
+                        let digestVerify = Digest.sha256(verifyTag24Bytes)
+
+                        // Fetch expected digest from ValueDigests
+                        let nsDigestsOpt = vd.get(ns)
+                        match (nsDigestsOpt) {
+                            case None => @Assert(false)
+                            case Some(nsDigests) =>
+                                let expectedDigestOpt = nsDigests.get(digestId)
+                                match (expectedDigestOpt) {
+                                    case None => @Assert(false)
+                                    case Some(expectedDigest) =>
+                                        @Assert(bytesEqualResp(digestVerify, expectedDigest))
+                                }
+                        }
+                }
+        }
+    }
+
+    /**
+     * Two items in same namespace, two different digestIDs.
+     * Both digests must match ValueDigests after round-trip.
+     */
+    @TestCase
+    func twoItemsDigestBothMatch(): Unit {
+        let ns = "org.iso.18013.5.1"
+
+        let item0 = IssuerSignedItem(
+            UInt64(0),
+            [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+             0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10],
+            "family_name",
+            CborValue.TextStringVal("Doe"),
+            None
+        )
+        let item1 = IssuerSignedItem(
+            UInt64(1),
+            [0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+             0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20],
+            "given_name",
+            CborValue.TextStringVal("John"),
+            None
+        )
+
+        let computeTag24Digest = { item: IssuerSignedItem =>
+            let bytes = item.encode()
+            let tag24 = CborValue.TaggedVal(CborTag.ENCODED_CBOR, CborValue.ByteStringVal(bytes))
+            Digest.sha256(tag24.encode())
+        }
+
+        let digest0 = computeTag24Digest(item0)
+        let digest1 = computeTag24Digest(item1)
+
+        let digestMap = HashMap<UInt64, Array<UInt8>>()
+        digestMap.add(UInt64(0), digest0)
+        digestMap.add(UInt64(1), digest1)
+        let digestIds = DigestIDs(digestMap)
+        let vdMap = HashMap<String, DigestIDs>()
+        vdMap.add(ns, digestIds)
+        let vd = ValueDigests(vdMap)
+
+        let items = ArrayList<IssuerSignedItem>()
+        items.add(item0)
+        items.add(item1)
+        let nsMap = HashMap<String, ArrayList<IssuerSignedItem>>()
+        nsMap.add(ns, items)
+        let issuerNs = IssuerNameSpaces(nsMap)
+
+        let decoded = IssuerNameSpaces.fromCbor(issuerNs.toCbor())
+        let decodedItemsOpt = decoded.get(ns)
+        match (decodedItemsOpt) {
+            case None => @Assert(false)
+            case Some(decodedItems) =>
+                var idx = 0
+                while (idx < decodedItems.size) {
+                    let di = decodedItems[idx]
+                    match (di.rawData) {
+                        case None => @Assert(false)
+                        case Some(rawData) =>
+                            let tag24 = CborValue.TaggedVal(
+                                CborTag.ENCODED_CBOR,
+                                CborValue.ByteStringVal(rawData)
+                            )
+                            let computedDigest = Digest.sha256(tag24.encode())
+                            let expectedOpt = vd.get(ns)
+                            match (expectedOpt) {
+                                case None => @Assert(false)
+                                case Some(nsDigests) =>
+                                    let dOpt = nsDigests.get(di.digestID)
+                                    match (dOpt) {
+                                        case None => @Assert(false)
+                                        case Some(expected) =>
+                                            @Assert(bytesEqualResp(computedDigest, expected))
+                                    }
+                            }
+                    }
+                    idx++
+                }
+        }
+    }
+
+    /**
+     * Digest drift detection: re-encoding from scratch (no rawData) changes bytes.
+     * This test documents the expected behavior — if rawData is NOT preserved,
+     * the digest will NOT match the original.
+     */
+    @TestCase
+    func digestDriftWhenRawDataAbsent(): Unit {
+        let item = IssuerSignedItem(
+            UInt64(0),
+            [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04,
+             0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C],
+            "document_number",
+            CborValue.TextStringVal("DL-999"),
+            None
+        )
+
+        // Compute digest from original encoding (rawData absent, uses toCbor)
+        let originalBytes = item.encode()
+        let tag24Original = CborValue.TaggedVal(CborTag.ENCODED_CBOR, CborValue.ByteStringVal(originalBytes))
+        let digest1 = Digest.sha256(tag24Original.encode())
+
+        // Construct a second item with identical fields but using fromCborBytes
+        let decodedItem = IssuerSignedItem.fromCborBytes(originalBytes)
+        let rawDataBytes = decodedItem.encode()
+        let tag24Decoded = CborValue.TaggedVal(CborTag.ENCODED_CBOR, CborValue.ByteStringVal(rawDataBytes))
+        let digest2 = Digest.sha256(tag24Decoded.encode())
+
+        // Both digests must be equal because rawData preserves the original bytes
+        @Assert(bytesEqualResp(digest1, digest2))
+    }
+}
+
+/* ================================================================== */
+/* Test class 6 — DocDataValue helper                                 */
+/* ================================================================== */
+
+@Test
+public class DocDataValueFromCborTest {
+
+    @TestCase
+    func cborTextStringToDocDataValue(): Unit {
+        let dv = cborToDocDataValue(CborValue.TextStringVal("hello"))
+        match (dv) {
+            case Some(DocDataValue.StringVal(s)) => @Assert(s, "hello")
+            case _ => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func cborBoolToDocDataValue(): Unit {
+        let dv = cborToDocDataValue(CborValue.BoolVal(true))
+        match (dv) {
+            case Some(DocDataValue.BooleanVal(b)) => @Assert(b)
+            case _ => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func cborUInt64ToDocDataValue(): Unit {
+        let dv = cborToDocDataValue(CborValue.UInt64Val(UInt64(42)))
+        match (dv) {
+            case Some(DocDataValue.IntegerVal(i)) => @Assert(i, UInt64(42))
+            case _ => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func cborBytesToDocDataValue(): Unit {
+        let bytes: Array<UInt8> = [0x01, 0x02, 0x03]
+        let dv = cborToDocDataValue(CborValue.ByteStringVal(bytes))
+        match (dv) {
+            case Some(DocDataValue.BytesVal(b)) => @Assert(bytesEqualResp(b, bytes))
+            case _ => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func cborTaggedDateToDocDataValue(): Unit {
+        let taggedDate = CborValue.TaggedVal(
+            CborTag.STANDARD_DATE_TIME,
+            CborValue.TextStringVal("2024-01-01T00:00:00Z")
+        )
+        let dv = cborToDocDataValue(taggedDate)
+        match (dv) {
+            case Some(DocDataValue.DateVal(d)) => @Assert(d, "2024-01-01T00:00:00Z")
+            case _ => @Assert(false)
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Added coverage: DocDataValue.describe,                            */
+/* IssuerSignedItem.docDataValue                                     */
+/* ------------------------------------------------------------------ */
+
+@Test
+public class ResponseDocDataValueDescribeTest {
+
+    /* describe() renders each variant in human-readable form. */
+    @TestCase
+    func describeAllVariants(): Unit {
+        @Assert(DocDataValue.BooleanVal(true).describe(), "true")
+        @Assert(DocDataValue.IntegerVal(UInt64(42)).describe(), "42")
+        @Assert(DocDataValue.StringVal("hello").describe(), "hello")
+        @Assert(DocDataValue.DateVal("2024-01-01").describe(), "2024-01-01")
+        @Assert(DocDataValue.ArrayVal.describe(), "Array")
+        @Assert(DocDataValue.DictionaryVal.describe(), "Dictionary")
+
+        let twoBytes: Array<UInt8> = [0xAAu8, 0xBBu8]
+        @Assert(DocDataValue.BytesVal(twoBytes).describe(), "Bytes 2")
+    }
+}
+
+@Test
+public class IssuerSignedItemDocDataValueTest {
+
+    /* docDataValue interprets a text elementValue as a StringVal. */
+    @TestCase
+    func docDataValueString(): Unit {
+        let item = IssuerSignedItem(
+            UInt64(0),
+            [0x01u8, 0x02u8],
+            "family_name",
+            CborValue.TextStringVal("Mustermann"),
+            None
+        )
+        match (item.docDataValue()) {
+            case Some(DocDataValue.StringVal(s)) => @Assert(s, "Mustermann")
+            case _ => @Assert(false)
+        }
+    }
+
+    /* docDataValue interprets a boolean elementValue as a BooleanVal. */
+    @TestCase
+    func docDataValueBool(): Unit {
+        let item = IssuerSignedItem(
+            UInt64(1),
+            [0x03u8],
+            "age_over_18",
+            CborValue.BoolVal(true),
+            None
+        )
+        match (item.docDataValue()) {
+            case Some(DocDataValue.BooleanVal(b)) => @Assert(b)
+            case _ => @Assert(false)
+        }
+    }
+}

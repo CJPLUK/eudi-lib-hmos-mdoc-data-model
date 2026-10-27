@@ -1,0 +1,482 @@
+/*
+ * mdoc_engagement_test.cj
+ *
+ * Unit tests for mdoc_engagement feature (done_when verification):
+ *   1. DeviceEngagement CBOR round-trip with Security/CoseKey/RetrievalMethods
+ *   2. QR device engagement string ("mdoc:base64url") generation and parsing
+ */
+package ohos_app_cangjie_eudi_cjmdoc_data_model_local_test
+
+import std.unittest.*
+import std.unittest.testmacro.*
+import std.collection.ArrayList
+
+import ohos_app_cangjie_eudi_cjcbor.cbor.CborValue
+
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.engagement.CoseEcCurve
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.engagement.CoseKey
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.engagement.CoseKeyPrivate
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.engagement.CoseKeyExchange
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.engagement.Security
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.engagement.DeviceRetrievalMethod
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.engagement.ServerRetrievalOption
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.engagement.ServerRetrievalOptions
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.engagement.OriginInfoWebsite
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.engagement.ConnectionMethodHttp
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.engagement.DeviceEngagement
+
+/* helper */
+func bytesEqualEng(a: Array<UInt8>, b: Array<UInt8>): Bool {
+    if (a.size != b.size) {
+        return false
+    }
+    var i = 0
+    while (i < a.size) {
+        if (a[i] != b[i]) {
+            return false
+        }
+        i++
+    }
+    return true
+}
+
+/* Sample P-256 public key coordinates (32 bytes each, all 0x01 / 0x02 for testing). */
+func sampleX(): Array<UInt8> {
+    let x: Array<UInt8> = Array<UInt8>(32, repeat: UInt8(0x01))
+    return x
+}
+
+func sampleY(): Array<UInt8> {
+    let y: Array<UInt8> = Array<UInt8>(32, repeat: UInt8(0x02))
+    return y
+}
+
+func sampleUuidBytes(): Array<UInt8> {
+    let b: Array<UInt8> = Array<UInt8>(16, repeat: UInt8(0xAB))
+    return b
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 1 — CoseKey CBOR round-trip                                    */
+/* ------------------------------------------------------------------ */
+
+@Test
+public class CoseKeyRoundTripTest {
+
+    @TestCase
+    func p256RoundTrip(): Unit {
+        let key = CoseKey(CoseEcCurve.P256, sampleX(), sampleY())
+        let cbor = key.toCbor()
+        let decoded = CoseKey.fromCborMap(cbor)
+        @Assert(decoded.crv.rawValue(), CoseEcCurve.P256.rawValue())
+        @Assert(decoded.kty, UInt64(2))
+        @Assert(bytesEqualEng(decoded.x, sampleX()))
+        @Assert(bytesEqualEng(decoded.y, sampleY()))
+    }
+
+    @TestCase
+    func p384RoundTrip(): Unit {
+        let x48: Array<UInt8> = Array<UInt8>(48, repeat: UInt8(0x03))
+        let y48: Array<UInt8> = Array<UInt8>(48, repeat: UInt8(0x04))
+        let key = CoseKey(CoseEcCurve.P384, x48, y48)
+        let cbor = key.toCbor()
+        let decoded = CoseKey.fromCborMap(cbor)
+        @Assert(decoded.crv.rawValue(), CoseEcCurve.P384.rawValue())
+        @Assert(bytesEqualEng(decoded.x, x48))
+        @Assert(bytesEqualEng(decoded.y, y48))
+    }
+
+    @TestCase
+    func taggedEncodedRoundTrip(): Unit {
+        let key = CoseKey(CoseEcCurve.P256, sampleX(), sampleY())
+        let tagged = key.toTaggedEncoded()
+        let decoded = CoseKey.fromTaggedEncoded(tagged)
+        @Assert(decoded.crv.rawValue(), CoseEcCurve.P256.rawValue())
+        @Assert(bytesEqualEng(decoded.x, sampleX()))
+        @Assert(bytesEqualEng(decoded.y, sampleY()))
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 2 — Security CBOR round-trip                                   */
+/* ------------------------------------------------------------------ */
+
+@Test
+public class SecurityRoundTripTest {
+
+    @TestCase
+    func roundTrip(): Unit {
+        let key = CoseKey(CoseEcCurve.P256, sampleX(), sampleY())
+        let sec = Security(key)
+        let cbor = sec.toCbor()
+        let decoded = Security.fromCbor(cbor)
+        @Assert(decoded.deviceKey.crv.rawValue(), CoseEcCurve.P256.rawValue())
+        @Assert(bytesEqualEng(decoded.deviceKey.x, sampleX()))
+        @Assert(bytesEqualEng(decoded.deviceKey.y, sampleY()))
+    }
+
+    @TestCase
+    func cborIsArray(): Unit {
+        let key = CoseKey(CoseEcCurve.P256, sampleX(), sampleY())
+        let sec = Security(key)
+        let cbor = sec.toCbor()
+        match (cbor) {
+            case CborValue.ArrayVal(items) =>
+                @Assert(items.size, Int64(2))
+                match (items[0]) {
+                    case CborValue.UInt64Val(n) => @Assert(n, UInt64(1))
+                    case _ => @Assert(false)
+                }
+            case _ => @Assert(false)
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 3 — DeviceRetrievalMethod CBOR round-trip                      */
+/* ------------------------------------------------------------------ */
+
+@Test
+public class DeviceRetrievalMethodRoundTripTest {
+
+    @TestCase
+    func nfcRoundTrip(): Unit {
+        let method = DeviceRetrievalMethod.Nfc(UInt64(256), UInt64(512))
+        let cbor = method.toCbor()
+        let decoded = DeviceRetrievalMethod.fromCbor(cbor)
+        match (decoded) {
+            case DeviceRetrievalMethod.Nfc(cmd, resp) =>
+                @Assert(cmd, UInt64(256))
+                @Assert(resp, UInt64(512))
+            case _ => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func blePeripheralRoundTrip(): Unit {
+        let uuidBytes = sampleUuidBytes()
+        let method = DeviceRetrievalMethod.Ble(true, uuidBytes, None)
+        let cbor = method.toCbor()
+        let decoded = DeviceRetrievalMethod.fromCbor(cbor)
+        match (decoded) {
+            case DeviceRetrievalMethod.Ble(isPeriph, uuid, _) =>
+                @Assert(isPeriph)
+                @Assert(bytesEqualEng(uuid, uuidBytes))
+            case _ => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func bleCentralRoundTrip(): Unit {
+        let uuidBytes = sampleUuidBytes()
+        let method = DeviceRetrievalMethod.Ble(false, uuidBytes, None)
+        let cbor = method.toCbor()
+        let decoded = DeviceRetrievalMethod.fromCbor(cbor)
+        match (decoded) {
+            case DeviceRetrievalMethod.Ble(isPeriph, uuid, _) =>
+                @Assert(!isPeriph)
+                @Assert(bytesEqualEng(uuid, uuidBytes))
+            case _ => @Assert(false)
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 4 — ServerRetrievalOption/Options CBOR round-trip              */
+/* ------------------------------------------------------------------ */
+
+@Test
+public class ServerRetrievalRoundTripTest {
+
+    @TestCase
+    func optionRoundTrip(): Unit {
+        let opt = ServerRetrievalOption("https://example.com/api", "mytoken123")
+        let cbor = opt.toCbor()
+        let decoded = ServerRetrievalOption.fromCbor(cbor)
+        @Assert(decoded.url, "https://example.com/api")
+        @Assert(decoded.token, "mytoken123")
+    }
+
+    @TestCase
+    func optionsWebApiRoundTrip(): Unit {
+        let opt = ServerRetrievalOption("https://webapi.example.com", "tok1")
+        let opts = ServerRetrievalOptions(Some(opt), None)
+        let cbor = opts.toCbor()
+        let decoded = ServerRetrievalOptions.fromCbor(cbor)
+        match (decoded.webAPI) {
+            case Some(w) =>
+                @Assert(w.url, "https://webapi.example.com")
+                @Assert(w.token, "tok1")
+            case None => @Assert(false)
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 5 — OriginInfoWebsite CBOR round-trip                          */
+/* ------------------------------------------------------------------ */
+
+@Test
+public class OriginInfoRoundTripTest {
+
+    @TestCase
+    func roundTrip(): Unit {
+        let oi = OriginInfoWebsite("https://wallet.example.eu", UInt64(1))
+        let cbor = oi.toCbor()
+        let decoded = OriginInfoWebsite.fromCbor(cbor)
+        @Assert(decoded.baseUrl, "https://wallet.example.eu")
+        @Assert(decoded.cat, UInt64(1))
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 6 — DeviceEngagement full CBOR round-trip (done_when 1)        */
+/* ------------------------------------------------------------------ */
+
+@Test
+public class DeviceEngagementRoundTripTest {
+
+    func buildEngagement(): DeviceEngagement {
+        let key = CoseKey(CoseEcCurve.P256, sampleX(), sampleY())
+        let sec = Security(key)
+        let methods = ArrayList<DeviceRetrievalMethod>()
+        methods.add(DeviceRetrievalMethod.Ble(false, sampleUuidBytes(), None))
+        methods.add(DeviceRetrievalMethod.Ble(true, sampleUuidBytes(), None))
+        return DeviceEngagement(
+            "1.0",
+            sec,
+            Some(methods),
+            None,
+            None
+        )
+    }
+
+    @TestCase
+    func cborRoundTripWithRetrieval(): Unit {
+        let de = buildEngagement()
+        let bytes = de.toCborBytes()
+        let decoded = DeviceEngagement.fromCborBytes(bytes)
+        @Assert(decoded.version, "1.0")
+        @Assert(bytesEqualEng(decoded.security.deviceKey.x, sampleX()))
+        @Assert(bytesEqualEng(decoded.security.deviceKey.y, sampleY()))
+        match (decoded.deviceRetrievalMethods) {
+            case Some(drms) =>
+                @Assert(drms.size, Int64(2))
+            case None => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func cborRoundTripMinimal(): Unit {
+        let key = CoseKey(CoseEcCurve.P256, sampleX(), sampleY())
+        let sec = Security(key)
+        let de = DeviceEngagement("1.0", sec, None, None, None)
+        let bytes = de.toCborBytes()
+        let decoded = DeviceEngagement.fromCborBytes(bytes)
+        @Assert(decoded.version, "1.0")
+        @Assert(decoded.security.deviceKey.crv.rawValue(), CoseEcCurve.P256.rawValue())
+    }
+
+    @TestCase
+    func cborRoundTripWithServerRetrieval(): Unit {
+        let key = CoseKey(CoseEcCurve.P256, sampleX(), sampleY())
+        let sec = Security(key)
+        let sro = ServerRetrievalOptions(
+            Some(ServerRetrievalOption("https://api.example.com", "token_abc")),
+            None
+        )
+        let de = DeviceEngagement("1.0", sec, None, Some(sro), None)
+        let bytes = de.toCborBytes()
+        let decoded = DeviceEngagement.fromCborBytes(bytes)
+        match (decoded.serverRetrievalOptions) {
+            case Some(opts) =>
+                match (opts.webAPI) {
+                    case Some(w) => @Assert(w.url, "https://api.example.com")
+                    case None => @Assert(false)
+                }
+            case None => @Assert(false)
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 7 — QR code generation and parsing round-trip (done_when 2)    */
+/* ------------------------------------------------------------------ */
+
+@Test
+public class QrCodeRoundTripTest {
+
+    @TestCase
+    func payloadStartsWithMdoc(): Unit {
+        let key = CoseKey(CoseEcCurve.P256, sampleX(), sampleY())
+        let sec = Security(key)
+        let methods = ArrayList<DeviceRetrievalMethod>()
+        methods.add(DeviceRetrievalMethod.Ble(true, sampleUuidBytes(), None))
+        let de = DeviceEngagement("1.0", sec, Some(methods), None, None)
+        let payload = de.getQrCodePayload()
+        @Assert(payload.startsWith("mdoc:"))
+    }
+
+    @TestCase
+    func qrRoundTrip(): Unit {
+        let key = CoseKey(CoseEcCurve.P256, sampleX(), sampleY())
+        let sec = Security(key)
+        let methods = ArrayList<DeviceRetrievalMethod>()
+        methods.add(DeviceRetrievalMethod.Ble(true, sampleUuidBytes(), None))
+        let de = DeviceEngagement("1.0", sec, Some(methods), None, None)
+        let payload = de.getQrCodePayload()
+        let decoded = DeviceEngagement.fromQrCodePayload(payload)
+        @Assert(decoded.version, "1.0")
+        @Assert(bytesEqualEng(decoded.security.deviceKey.x, sampleX()))
+        @Assert(bytesEqualEng(decoded.security.deviceKey.y, sampleY()))
+        match (decoded.deviceRetrievalMethods) {
+            case Some(drms) =>
+                @Assert(drms.size, Int64(1))
+                match (drms[0]) {
+                    case DeviceRetrievalMethod.Ble(isPeriph, _, _) =>
+                        @Assert(isPeriph)
+                    case _ => @Assert(false)
+                }
+            case None => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func qrPayloadIsBase64UrlEncoded(): Unit {
+        let key = CoseKey(CoseEcCurve.P256, sampleX(), sampleY())
+        let sec = Security(key)
+        let de = DeviceEngagement("1.0", sec, None, None, None)
+        let payload = de.getQrCodePayload()
+        let b64part = payload.removePrefix("mdoc:")
+        @Assert(!b64part.contains("="))
+        @Assert(!b64part.contains("+"))
+        @Assert(!b64part.contains("/"))
+    }
+
+    @TestCase
+    func qrRoundTripWithMultipleMethods(): Unit {
+        let key = CoseKey(CoseEcCurve.P256, sampleX(), sampleY())
+        let sec = Security(key)
+        let methods = ArrayList<DeviceRetrievalMethod>()
+        methods.add(DeviceRetrievalMethod.Ble(false, sampleUuidBytes(), None))
+        methods.add(DeviceRetrievalMethod.Ble(true, sampleUuidBytes(), None))
+        methods.add(DeviceRetrievalMethod.Nfc(UInt64(256), UInt64(512)))
+        let de = DeviceEngagement("1.0", sec, Some(methods), None, None)
+        let payload = de.getQrCodePayload()
+        let decoded = DeviceEngagement.fromQrCodePayload(payload)
+        match (decoded.deviceRetrievalMethods) {
+            case Some(drms) =>
+                @Assert(drms.size, Int64(3))
+            case None => @Assert(false)
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Added coverage: CoseKeyPrivate.withPublicKey, CoseKeyExchange,      */
+/* ServerRetrievalOptions.isEmpty, DeviceEngagement.forBle            */
+/* ------------------------------------------------------------------ */
+
+@Test
+public class CoseKeyPrivateAndExchangeTest {
+
+    /* withPublicKey copies the public key and derives the curve from it. */
+    @TestCase
+    func withPublicKeyDerivesCurve(): Unit {
+        let pub = CoseKey(CoseEcCurve.P384, sampleX(), sampleY())
+        let priv = CoseKeyPrivate.withPublicKey(pub, "key-id-1")
+        @Assert(priv.privateKeyId, "key-id-1")
+        @Assert(priv.curve.rawValue(), CoseEcCurve.P384.rawValue())
+        match (priv.publicKey) {
+            case Some(k) => @Assert(k.crv.rawValue(), CoseEcCurve.P384.rawValue())
+            case None => @Assert(false)
+        }
+    }
+
+    /* CoseKeyExchange holds a remote public key plus a local private key. */
+    @TestCase
+    func exchangeHoldsBothKeys(): Unit {
+        let localPub = CoseKey(CoseEcCurve.P256, sampleX(), sampleY())
+        let priv = CoseKeyPrivate.withPublicKey(localPub, "local-id")
+        let remotePub = CoseKey(CoseEcCurve.P256, sampleY(), sampleX())
+        let exchange = CoseKeyExchange(Some(remotePub), priv)
+
+        @Assert(exchange.privateKey.privateKeyId, "local-id")
+        match (exchange.publicKey) {
+            case Some(k) => @Assert(bytesEqualEng(k.x, sampleY()))
+            case None => @Assert(false)
+        }
+    }
+}
+
+@Test
+public class ServerRetrievalOptionsIsEmptyTest {
+
+    /* isEmpty is true when neither webAPI nor OIDC is set. */
+    @TestCase
+    func emptyWhenNoOptions(): Unit {
+        let opts = ServerRetrievalOptions(None, None)
+        @Assert(opts.isEmpty())
+    }
+
+    /* isEmpty is false when at least one option is present. */
+    @TestCase
+    func notEmptyWhenWebApiSet(): Unit {
+        let web = ServerRetrievalOption("https://example.com/api", "tok")
+        let opts = ServerRetrievalOptions(Some(web), None)
+        @Assert(!opts.isEmpty())
+    }
+}
+
+@Test
+public class DeviceEngagementForBleTest {
+
+    /* forBle returns Some with one method per supported BLE role. */
+    @TestCase
+    func bothRolesYieldTwoMethods(): Unit {
+        let key = CoseKey(CoseEcCurve.P256, sampleX(), sampleY())
+        let sec = Security(key)
+        let deOpt = DeviceEngagement.forBle(sec, true, true, sampleUuidBytes())
+        match (deOpt) {
+            case None => @Assert(false)
+            case Some(de) =>
+                match (de.deviceRetrievalMethods) {
+                    case Some(methods) => @Assert(methods.size, Int64(2))
+                    case None => @Assert(false)
+                }
+        }
+    }
+
+    @TestCase
+    func singleRoleYieldsOneMethod(): Unit {
+        let key = CoseKey(CoseEcCurve.P256, sampleX(), sampleY())
+        let sec = Security(key)
+        let deOpt = DeviceEngagement.forBle(sec, true, false, sampleUuidBytes())
+        match (deOpt) {
+            case None => @Assert(false)
+            case Some(de) =>
+                match (de.deviceRetrievalMethods) {
+                    case Some(methods) => @Assert(methods.size, Int64(1))
+                    case None => @Assert(false)
+                }
+        }
+    }
+
+    /* forBle returns None when no BLE role is supported. */
+    @TestCase
+    func noRoleYieldsNone(): Unit {
+        let key = CoseKey(CoseEcCurve.P256, sampleX(), sampleY())
+        let sec = Security(key)
+        let deOpt = DeviceEngagement.forBle(sec, false, false, sampleUuidBytes())
+        @Assert(deOpt.isNone())
+    }
+
+    /* ISO 18013-5 BLE UUID is a 16-byte bstr, never 32 ASCII hex bytes. */
+    @TestCase
+    func invalidUuidLengthYieldsNone(): Unit {
+        let key = CoseKey(CoseEcCurve.P256, sampleX(), sampleY())
+        let sec = Security(key)
+        let asciiHexUuid = Array<UInt8>(32, repeat: UInt8(0x41))
+        @Assert(DeviceEngagement.forBle(sec, false, true, asciiHexUuid).isNone())
+    }
+}

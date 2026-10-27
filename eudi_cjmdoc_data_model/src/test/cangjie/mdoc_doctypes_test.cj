@@ -1,0 +1,571 @@
+/*
+ * mdoc_doctypes_test.cj
+ *
+ * Unit tests for mdoc_doctypes feature:
+ *   done_when 1: IsoMdlModel/EuPidModel 能从 claims 数据构造并按 docType 注册分发
+ *   done_when 2: DrivingPrivileges CBOR 往返无损
+ *   done_when 3: AgeAttesting 年龄断言计算正确（含边界值）
+ */
+package ohos_app_cangjie_eudi_cjmdoc_data_model_local_test
+
+import std.unittest.*
+import std.unittest.testmacro.*
+import std.collection.ArrayList
+import std.collection.HashMap
+
+import ohos_app_cangjie_eudi_cjcbor.cbor.CborValue
+import ohos_app_cangjie_eudi_cjcbor.cbor.decodeCbor
+
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.claims.DocClaimsDecodableRegistry
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.claims.DocDataFormat
+
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.doctypes.ISO_MDL_DOC_TYPE
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.doctypes.ISO_MDL_NAMESPACE
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.doctypes.EU_PID_DOC_TYPE
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.doctypes.EU_PID_NAMESPACE
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.doctypes.DrivingPrivilegeCode
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.doctypes.DrivingPrivilege
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.doctypes.DrivingPrivileges
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.doctypes.IsoMdlModel
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.doctypes.IsoMdlModelFactory
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.doctypes.EuPidModel
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.doctypes.EuPidModelFactory
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.doctypes.ageAttestIsOver
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.doctypes.registerKnownDocTypeFactories
+
+/* ================================================================
+ * done_when 2 — DrivingPrivileges CBOR 往返无损
+ * ================================================================ */
+
+@Test
+public class DrivingPrivilegeCodeCborTest {
+
+    @TestCase
+    func roundTripAllFields(): Unit {
+        let code = DrivingPrivilegeCode("B", Some("="), Some("5"))
+        let encoded = code.toCbor()
+        let bytes = encoded.encode()
+        let decoded = decodeCbor(bytes)
+        match (DrivingPrivilegeCode.fromCbor(decoded)) {
+            case Some(rt) =>
+                @Assert(rt.code, "B")
+                @Assert(rt.sign, Some("="))
+                @Assert(rt.value, Some("5"))
+            case None => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func roundTripCodeOnly(): Unit {
+        let code = DrivingPrivilegeCode("A", None, None)
+        let bytes = code.toCbor().encode()
+        let decoded = decodeCbor(bytes)
+        match (DrivingPrivilegeCode.fromCbor(decoded)) {
+            case Some(rt) =>
+                @Assert(rt.code, "A")
+                @Assert(rt.sign.isNone())
+                @Assert(rt.value.isNone())
+            case None => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func decodeMissingCodeReturnsNone(): Unit {
+        /* CBOR map without "code" key */
+        let pairs = ArrayList<(CborValue, CborValue)>()
+        pairs.add((CborValue.TextStringVal("sign"), CborValue.TextStringVal("+")))
+        match (DrivingPrivilegeCode.fromCbor(CborValue.MapVal(pairs))) {
+            case None => @Assert(true)
+            case _    => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func decodeWrongTopLevelReturnsNone(): Unit {
+        match (DrivingPrivilegeCode.fromCbor(CborValue.TextStringVal("bad"))) {
+            case None => @Assert(true)
+            case _    => @Assert(false)
+        }
+    }
+}
+
+@Test
+public class DrivingPrivilegeCborTest {
+
+    @TestCase
+    func roundTripFull(): Unit {
+        let codes = ArrayList<DrivingPrivilegeCode>()
+        codes.add(DrivingPrivilegeCode("B1", Some("="), Some("10")))
+        let priv = DrivingPrivilege(
+            "B",
+            Some("2020-01-01"),
+            Some("2030-01-01"),
+            Some(codes)
+        )
+        let bytes = priv.toCbor().encode()
+        let decoded = decodeCbor(bytes)
+        match (DrivingPrivilege.fromCbor(decoded)) {
+            case Some(rt) =>
+                @Assert(rt.vehicleCategoryCode, "B")
+                @Assert(rt.issueDate, Some("2020-01-01"))
+                @Assert(rt.expiryDate, Some("2030-01-01"))
+                match (rt.codes) {
+                    case Some(cs) =>
+                        @Assert(cs.size, Int64(1))
+                        @Assert(cs[0].code, "B1")
+                    case None => @Assert(false)
+                }
+            case None => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func roundTripNoDates(): Unit {
+        let priv = DrivingPrivilege("AM", None, None, None)
+        let bytes = priv.toCbor().encode()
+        let decoded = decodeCbor(bytes)
+        match (DrivingPrivilege.fromCbor(decoded)) {
+            case Some(rt) =>
+                @Assert(rt.vehicleCategoryCode, "AM")
+                @Assert(rt.issueDate.isNone())
+                @Assert(rt.expiryDate.isNone())
+                @Assert(rt.codes.isNone())
+            case None => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func decodeMissingVcCodeReturnsNone(): Unit {
+        let pairs = ArrayList<(CborValue, CborValue)>()
+        pairs.add((CborValue.TextStringVal("issue_date"), CborValue.TextStringVal("2020-01-01")))
+        match (DrivingPrivilege.fromCbor(CborValue.MapVal(pairs))) {
+            case None => @Assert(true)
+            case _    => @Assert(false)
+        }
+    }
+}
+
+@Test
+public class DrivingPrivilegesCborTest {
+
+    @TestCase
+    func roundTripMultiplePrivileges(): Unit {
+        let privs = ArrayList<DrivingPrivilege>()
+        privs.add(DrivingPrivilege("A", Some("2019-06-01"), None, None))
+        privs.add(DrivingPrivilege("B", None, Some("2035-12-31"), None))
+        let dp = DrivingPrivileges(privs)
+        let bytes = dp.toCbor().encode()
+        let decoded = decodeCbor(bytes)
+        match (DrivingPrivileges.fromCbor(decoded)) {
+            case Some(rt) =>
+                @Assert(rt.size(), Int64(2))
+                @Assert(rt.get(0).vehicleCategoryCode, "A")
+                @Assert(rt.get(1).vehicleCategoryCode, "B")
+                @Assert(rt.get(0).issueDate, Some("2019-06-01"))
+                @Assert(rt.get(1).expiryDate, Some("2035-12-31"))
+            case None => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func roundTripEmpty(): Unit {
+        let dp = DrivingPrivileges(ArrayList<DrivingPrivilege>())
+        let bytes = dp.toCbor().encode()
+        let decoded = decodeCbor(bytes)
+        match (DrivingPrivileges.fromCbor(decoded)) {
+            case Some(rt) => @Assert(rt.size(), Int64(0))
+            case None     => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func decodeBadTopLevelReturnsNone(): Unit {
+        match (DrivingPrivileges.fromCbor(CborValue.UInt64Val(42))) {
+            case None => @Assert(true)
+            case _    => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func roundTripWithCodes(): Unit {
+        /* Full round-trip including nested DrivingPrivilegeCode */
+        let codes = ArrayList<DrivingPrivilegeCode>()
+        codes.add(DrivingPrivilegeCode("L", None, None))
+        codes.add(DrivingPrivilegeCode("M", Some("="), Some("3")))
+        let privs = ArrayList<DrivingPrivilege>()
+        privs.add(DrivingPrivilege("BE", Some("2021-03-15"), Some("2031-03-15"), Some(codes)))
+        let dp = DrivingPrivileges(privs)
+
+        let bytes = dp.toCbor().encode()
+        let decoded = decodeCbor(bytes)
+        match (DrivingPrivileges.fromCbor(decoded)) {
+            case Some(rt) =>
+                @Assert(rt.size(), Int64(1))
+                let p0 = rt.get(0)
+                @Assert(p0.vehicleCategoryCode, "BE")
+                match (p0.codes) {
+                    case Some(cs) =>
+                        @Assert(cs.size, Int64(2))
+                        @Assert(cs[0].code, "L")
+                        @Assert(cs[1].code, "M")
+                        @Assert(cs[1].sign, Some("="))
+                        @Assert(cs[1].value, Some("3"))
+                    case None => @Assert(false)
+                }
+            case None => @Assert(false)
+        }
+    }
+}
+
+/* ================================================================
+ * done_when 3 — AgeAttesting 年龄断言计算正确（含边界值）
+ * ================================================================ */
+
+@Test
+public class AgeAttestingTest {
+
+    /* Helper: build HashMap<Int64, Bool> from pairs */
+    func makeAgeMap(pairs: Array<(Int64, Bool)>): HashMap<Int64, Bool> {
+        let m = HashMap<Int64, Bool>()
+        var i: Int64 = 0
+        while (i < pairs.size) {
+            let (k, v) = pairs[i]
+            m.add(k, v)
+            i++
+        }
+        return m
+    }
+
+    @TestCase
+    func isOverExactMatchTrue(): Unit {
+        /* age_over_18=true, age_over_21=true → isOver(18) → (18, true) */
+        let m = makeAgeMap([(18, true), (21, true)])
+        match (ageAttestIsOver(m, 18)) {
+            case Some((k, v)) =>
+                @Assert(k, Int64(18))
+                @Assert(v)
+            case None => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func isOverSmallestTrueAbove(): Unit {
+        /* age_over_18=true, age_over_21=true → isOver(15) → (18, true) [smallest >= 15 that is true] */
+        let m = makeAgeMap([(18, true), (21, true)])
+        match (ageAttestIsOver(m, 15)) {
+            case Some((k, v)) =>
+                @Assert(k, Int64(18))
+                @Assert(v)
+            case None => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func isOverFallbackToFalseBelow(): Unit {
+        /* age_over_18=false → isOver(21) → (18, false) */
+        let m = makeAgeMap([(18, false)])
+        match (ageAttestIsOver(m, 21)) {
+            case Some((k, v)) =>
+                @Assert(k, Int64(18))
+                @Assert(!v)
+            case None => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func isOverNoneWhenEmpty(): Unit {
+        let m = makeAgeMap([])
+        match (ageAttestIsOver(m, 18)) {
+            case None => @Assert(true)
+            case _    => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func isOverBoundaryExact(): Unit {
+        /* Exactly at boundary: age_over_21=true → isOver(21) → (21, true) */
+        let m = makeAgeMap([(21, true)])
+        match (ageAttestIsOver(m, 21)) {
+            case Some((k, v)) =>
+                @Assert(k, Int64(21))
+                @Assert(v)
+            case None => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func isOverPicksNearestTrue(): Unit {
+        /* age_over_18=true, age_over_21=true, age_over_65=true → isOver(20) → (21, true) */
+        let m = makeAgeMap([(18, true), (21, true), (65, true)])
+        match (ageAttestIsOver(m, 20)) {
+            case Some((k, _)) => @Assert(k, Int64(21))
+            case None         => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func isOverTrueAndFalseMixed(): Unit {
+        /* age_over_18=true, age_over_21=false → isOver(25) → (21, false) [largest false <= 25] */
+        let m = makeAgeMap([(18, true), (21, false)])
+        match (ageAttestIsOver(m, 25)) {
+            case Some((k, v)) =>
+                @Assert(k, Int64(21))
+                @Assert(!v)
+            case None => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func isOverNoneWhenBelowAllFalse(): Unit {
+        /* age_over_25=false → isOver(18) → None (no false at or below 18) */
+        let m = makeAgeMap([(25, false)])
+        match (ageAttestIsOver(m, 18)) {
+            case None => @Assert(true)
+            case _    => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func isOverOnlyAge21TrueRequestAge18(): Unit {
+        /* iOS AgeAttesting.swift nearest-match: data has only {21: true}.
+         * isOver(18): no true key >= 18 with exact 18 present, but 21 >= 18 and is true.
+         * Smallest true key >= 18 is 21 → returns (21, true).
+         */
+        let m = makeAgeMap([(21, true)])
+        match (ageAttestIsOver(m, 18)) {
+            case Some((k, v)) =>
+                @Assert(k, Int64(21))
+                @Assert(v)
+            case None => @Assert(false)
+        }
+    }
+}
+
+/* ================================================================
+ * done_when 1 — IsoMdlModel/EuPidModel 能从 claims 数据构造并按 docType 注册分发
+ * ================================================================ */
+
+@Test
+public class IsoMdlModelTest {
+
+    @TestCase
+    func constructFromClaims(): Unit {
+        let nsMap = HashMap<String, CborValue>()
+        nsMap.add("family_name", CborValue.TextStringVal("Mustermann"))
+        nsMap.add("given_name", CborValue.TextStringVal("Max"))
+        nsMap.add("document_number", CborValue.TextStringVal("T22000129"))
+        nsMap.add("issuing_country", CborValue.TextStringVal("DE"))
+        nsMap.add("age_over_18", CborValue.BoolVal(true))
+        nsMap.add("age_over_21", CborValue.BoolVal(true))
+
+        let claims = HashMap<String, HashMap<String, CborValue>>()
+        claims.add(ISO_MDL_NAMESPACE, nsMap)
+
+        let model = IsoMdlModel("test-mdl-001", claims, None)
+
+        @Assert(model.getId(), "test-mdl-001")
+        @Assert(model.getDocType(), "org.iso.18013.5.1.mDL")
+        @Assert(model.familyName, Some("Mustermann"))
+        @Assert(model.givenName, Some("Max"))
+        @Assert(model.documentNumber, Some("T22000129"))
+        @Assert(model.issuingCountry, Some("DE"))
+        match (model.getDocDataFormat()) {
+            case DocDataFormat.Cbor => @Assert(true)
+            case _                  => @Assert(false)
+        }
+        let claims_ = model.getDocClaims()
+        @Assert(claims_.size > Int64(0))
+    }
+
+    @TestCase
+    func constructWithDrivingPrivileges(): Unit {
+        let codes = ArrayList<DrivingPrivilegeCode>()
+        codes.add(DrivingPrivilegeCode("B1", None, None))
+        let privs = ArrayList<DrivingPrivilege>()
+        privs.add(DrivingPrivilege("B", Some("2018-01-01"), Some("2028-01-01"), Some(codes)))
+        let dp = DrivingPrivileges(privs)
+        let dpCbor = dp.toCbor()
+
+        let nsMap = HashMap<String, CborValue>()
+        nsMap.add("family_name", CborValue.TextStringVal("Smith"))
+        nsMap.add("driving_privileges", dpCbor)
+
+        let claims = HashMap<String, HashMap<String, CborValue>>()
+        claims.add(ISO_MDL_NAMESPACE, nsMap)
+
+        let model = IsoMdlModel("test-mdl-002", claims, None)
+        @Assert(model.familyName, Some("Smith"))
+        match (model.drivingPrivileges) {
+            case Some(dp2) =>
+                @Assert(dp2.size(), Int64(1))
+                @Assert(dp2.get(0).vehicleCategoryCode, "B")
+            case None => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func ageAttestation(): Unit {
+        let nsMap = HashMap<String, CborValue>()
+        nsMap.add("age_over_18", CborValue.BoolVal(true))
+        nsMap.add("age_over_21", CborValue.BoolVal(false))
+        let claims = HashMap<String, HashMap<String, CborValue>>()
+        claims.add(ISO_MDL_NAMESPACE, nsMap)
+
+        let model = IsoMdlModel("test-mdl-003", claims, None)
+
+        match (model.isOver(18)) {
+            case Some((k, v)) =>
+                @Assert(k, Int64(18))
+                @Assert(v)
+            case None => @Assert(false)
+        }
+        match (model.isOver(25)) {
+            case Some((k, v)) =>
+                @Assert(k, Int64(21))
+                @Assert(!v)
+            case None => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func emptyClaimsConstructs(): Unit {
+        let claims = HashMap<String, HashMap<String, CborValue>>()
+        let model = IsoMdlModel("test-mdl-empty", claims, None)
+        @Assert(model.getDocType(), ISO_MDL_DOC_TYPE)
+        @Assert(model.familyName.isNone())
+        @Assert(model.getDocClaims().size, Int64(0))
+    }
+}
+
+@Test
+public class EuPidModelTest {
+
+    @TestCase
+    func constructFromClaims(): Unit {
+        let nsMap = HashMap<String, CborValue>()
+        nsMap.add("family_name", CborValue.TextStringVal("Garcia"))
+        nsMap.add("given_name", CborValue.TextStringVal("Maria"))
+        nsMap.add("birth_date", CborValue.TextStringVal("1985-05-20"))
+        nsMap.add("birth_place", CborValue.TextStringVal("Madrid"))
+        nsMap.add("issuing_country", CborValue.TextStringVal("ES"))
+        nsMap.add("age_over_18", CborValue.BoolVal(true))
+
+        let claims = HashMap<String, HashMap<String, CborValue>>()
+        claims.add(EU_PID_NAMESPACE, nsMap)
+
+        let model = EuPidModel("test-pid-001", claims, None)
+
+        @Assert(model.getId(), "test-pid-001")
+        @Assert(model.getDocType(), "eu.europa.ec.eudi.pid.1")
+        @Assert(model.familyName, Some("Garcia"))
+        @Assert(model.givenName, Some("Maria"))
+        @Assert(model.birthDate, Some("1985-05-20"))
+        @Assert(model.birthPlace, Some("Madrid"))
+        @Assert(model.issuingCountry, Some("ES"))
+        match (model.getDocDataFormat()) {
+            case DocDataFormat.Cbor => @Assert(true)
+            case _                  => @Assert(false)
+        }
+        let ageMap = model.getAgeOverXX()
+        @Assert(ageMap.contains(18))
+    }
+
+    @TestCase
+    func ageAttestation(): Unit {
+        let nsMap = HashMap<String, CborValue>()
+        nsMap.add("age_over_18", CborValue.BoolVal(true))
+        nsMap.add("age_over_65", CborValue.BoolVal(false))
+        let claims = HashMap<String, HashMap<String, CborValue>>()
+        claims.add(EU_PID_NAMESPACE, nsMap)
+
+        let model = EuPidModel("test-pid-002", claims, None)
+
+        match (model.isOver(18)) {
+            case Some((k, v)) =>
+                @Assert(k, Int64(18))
+                @Assert(v)
+            case None => @Assert(false)
+        }
+        match (model.isOver(70)) {
+            case Some((k, v)) =>
+                @Assert(k, Int64(65))
+                @Assert(!v)
+            case None => @Assert(false)
+        }
+    }
+}
+
+/* ================================================================
+ * done_when 1 (registry dispatch part) —
+ * IsoMdlModel/EuPidModel 按 docType 注册分发
+ * ================================================================ */
+
+@Test
+public class KnownDocTypeRegistryTest {
+
+    @TestCase
+    func registerAndDispatchMdl(): Unit {
+        /* Register factories */
+        registerKnownDocTypeFactories()
+
+        @Assert(DocClaimsDecodableRegistry.isRegistered(ISO_MDL_DOC_TYPE))
+
+        let nsMap = HashMap<String, CborValue>()
+        nsMap.add("family_name", CborValue.TextStringVal("Weber"))
+        nsMap.add("age_over_18", CborValue.BoolVal(true))
+        let claims = HashMap<String, HashMap<String, CborValue>>()
+        claims.add(ISO_MDL_NAMESPACE, nsMap)
+
+        let result = DocClaimsDecodableRegistry.make(ISO_MDL_DOC_TYPE, claims, None)
+        match (result) {
+            case Some(doc) =>
+                @Assert(doc.getDocType(), ISO_MDL_DOC_TYPE)
+                match (doc.getDocDataFormat()) {
+                    case DocDataFormat.Cbor => @Assert(true)
+                    case _                  => @Assert(false)
+                }
+                @Assert(doc.getDocClaims().size > Int64(0))
+            case None => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func registerAndDispatchPid(): Unit {
+        registerKnownDocTypeFactories()
+
+        @Assert(DocClaimsDecodableRegistry.isRegistered(EU_PID_DOC_TYPE))
+
+        let nsMap = HashMap<String, CborValue>()
+        nsMap.add("family_name", CborValue.TextStringVal("Rossi"))
+        nsMap.add("birth_date", CborValue.TextStringVal("1990-03-10"))
+        let claims = HashMap<String, HashMap<String, CborValue>>()
+        claims.add(EU_PID_NAMESPACE, nsMap)
+
+        let result = DocClaimsDecodableRegistry.make(EU_PID_DOC_TYPE, claims, None)
+        match (result) {
+            case Some(doc) =>
+                @Assert(doc.getDocType(), EU_PID_DOC_TYPE)
+            case None => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func factoryReturnsNoneForWrongDocType(): Unit {
+        let factory = IsoMdlModelFactory()
+        let claims = HashMap<String, HashMap<String, CborValue>>()
+        match (factory.make("wrong.doctype", claims, None)) {
+            case None => @Assert(true)
+            case _    => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func pidFactoryReturnsNoneForWrongDocType(): Unit {
+        let factory = EuPidModelFactory()
+        let claims = HashMap<String, HashMap<String, CborValue>>()
+        match (factory.make("org.iso.18013.5.1.mDL", claims, None)) {
+            case None => @Assert(true)
+            case _    => @Assert(false)
+        }
+    }
+}

@@ -1,0 +1,415 @@
+/*
+ * mdoc_zkp_test.cj
+ *
+ * Unit tests for mdoc_zkp feature:
+ *   1. ZkParam CBOR round-trip (all four variants)
+ *   2. ZkSystemSpec CBOR round-trip containing params
+ *   3. ZkSystemRepository: register / lookup / not-found / getAllZkSystemSpecs
+ */
+package ohos_app_cangjie_eudi_cjmdoc_data_model_local_test
+
+import std.unittest.*
+import std.unittest.testmacro.*
+import std.collection.ArrayList
+
+import ohos_app_cangjie_eudi_cjcbor.cbor.CborValue
+import ohos_app_cangjie_eudi_cjcbor.cbor.decodeCbor
+
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.zkp.ZkParam
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.zkp.ZkParams
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.zkp.ZkSystemSpec
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.zkp.ZkSystemProtocol
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.zkp.ZkSystemRepository
+
+/* ------------------------------------------------------------------ */
+/* Helpers                                                             */
+/* ------------------------------------------------------------------ */
+
+func bytesEqualZkp(a: Array<UInt8>, b: Array<UInt8>): Bool {
+    if (a.size != b.size) {
+        return false
+    }
+    var i = 0
+    while (i < a.size) {
+        if (a[i] != b[i]) {
+            return false
+        }
+        i++
+    }
+    return true
+}
+
+/** Minimal ZkSystemProtocol implementation for testing. */
+class FakeZkSystem <: ZkSystemProtocol {
+    let _name: String
+    let _specs: ArrayList<ZkSystemSpec>
+
+    public init(n: String, s: ArrayList<ZkSystemSpec>) {
+        this._name = n
+        this._specs = s
+    }
+
+    public prop name: String {
+        get() { return this._name }
+    }
+
+    public prop systemSpecs: ArrayList<ZkSystemSpec> {
+        get() { return this._specs }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 1 — ZkParam CBOR round-trip                                   */
+/* ------------------------------------------------------------------ */
+
+@Test
+public class ZkParamRoundTripTest {
+
+    @TestCase
+    func intParamPositiveRoundTrip(): Unit {
+        let original = ZkParam.IntParam(42)
+        let cbor = original.toCbor()
+        let bytes = cbor.encode()
+        let back = ZkParam.fromCbor(decodeCbor(bytes))
+        match (back) {
+            case ZkParam.IntParam(v) => @Assert(v, Int64(42))
+            case _ => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func intParamNegativeRoundTrip(): Unit {
+        let original = ZkParam.IntParam(-7)
+        let cbor = original.toCbor()
+        let bytes = cbor.encode()
+        let back = ZkParam.fromCbor(decodeCbor(bytes))
+        match (back) {
+            case ZkParam.IntParam(v) => @Assert(v, Int64(-7))
+            case _ => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func doubleParamRoundTrip(): Unit {
+        let original = ZkParam.DoubleParam(3.14)
+        let cbor = original.toCbor()
+        let bytes = cbor.encode()
+        let back = ZkParam.fromCbor(decodeCbor(bytes))
+        match (back) {
+            case ZkParam.DoubleParam(v) =>
+                // Accept small floating-point diff
+                let diff = if (v > 3.14) { v - 3.14 } else { 3.14 - v }
+                @Assert(diff < 0.001)
+            case _ => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func boolParamRoundTrip(): Unit {
+        let t = ZkParam.BoolParam(true)
+        let f = ZkParam.BoolParam(false)
+        let tBack = ZkParam.fromCbor(decodeCbor(t.toCbor().encode()))
+        let fBack = ZkParam.fromCbor(decodeCbor(f.toCbor().encode()))
+        match (tBack) {
+            case ZkParam.BoolParam(v) => @Assert(v)
+            case _ => @Assert(false)
+        }
+        match (fBack) {
+            case ZkParam.BoolParam(v) => @Assert(!v)
+            case _ => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func stringParamRoundTrip(): Unit {
+        let original = ZkParam.StringParam("groth16")
+        let cbor = original.toCbor()
+        let bytes = cbor.encode()
+        let back = ZkParam.fromCbor(decodeCbor(bytes))
+        match (back) {
+            case ZkParam.StringParam(s) => @Assert(s, "groth16")
+            case _ => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func intParamConvenienceAccessor(): Unit {
+        let p = ZkParam.IntParam(100)
+        let iv = p.intValue()
+        @Assert(iv.isSome())
+        match (iv) {
+            case Some(v) => @Assert(v, Int64(100))
+            case None => @Assert(false)
+        }
+        let dv = p.doubleValue()
+        @Assert(dv.isNone())
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 2 — ZkSystemSpec CBOR round-trip                              */
+/* ------------------------------------------------------------------ */
+
+@Test
+public class ZkSystemSpecRoundTripTest {
+
+    @TestCase
+    func basicSpecRoundTrip(): Unit {
+        let params: ZkParams = ArrayList<(String, ZkParam)>()
+        params.add(("degree", ZkParam.IntParam(256)))
+        params.add(("scheme", ZkParam.StringParam("groth16")))
+        params.add(("secure", ZkParam.BoolParam(true)))
+
+        let exts: ArrayList<(String, CborValue)> = ArrayList<(String, CborValue)>()
+
+        let spec = ZkSystemSpec("zk-snark-v1", "zk-snark", params, exts)
+
+        let bytes = spec.encode()
+        let decoded = ZkSystemSpec.decode(bytes)
+
+        @Assert(decoded.system, "zk-snark")
+        @Assert(decoded.zkSystemId, "zk-snark-v1")
+        @Assert(decoded.params.size, Int64(3))
+
+        // Check params are all present
+        var foundDegree = false
+        var foundScheme = false
+        var foundSecure = false
+        for ((k, v) in decoded.params) {
+            if (k == "degree") {
+                match (v) {
+                    case ZkParam.IntParam(n) =>
+                        @Assert(n, Int64(256))
+                        foundDegree = true
+                    case _ => @Assert(false)
+                }
+            } else if (k == "scheme") {
+                match (v) {
+                    case ZkParam.StringParam(s) =>
+                        @Assert(s, "groth16")
+                        foundScheme = true
+                    case _ => @Assert(false)
+                }
+            } else if (k == "secure") {
+                match (v) {
+                    case ZkParam.BoolParam(b) =>
+                        @Assert(b)
+                        foundSecure = true
+                    case _ => @Assert(false)
+                }
+            }
+        }
+        @Assert(foundDegree)
+        @Assert(foundScheme)
+        @Assert(foundSecure)
+    }
+
+    @TestCase
+    func specWithSystemFallback(): Unit {
+        // When zkSystemId key is absent, decode falls back to system value
+        // Construct raw CBOR map without zkSystemId key
+        let paramPairs: ArrayList<(CborValue, CborValue)> = ArrayList<(CborValue, CborValue)>()
+        let outerPairs: ArrayList<(CborValue, CborValue)> = ArrayList<(CborValue, CborValue)>()
+        outerPairs.add((CborValue.TextStringVal("system"), CborValue.TextStringVal("bls12-381")))
+        outerPairs.add((CborValue.TextStringVal("params"), CborValue.MapVal(paramPairs)))
+        let rawCbor = CborValue.MapVal(outerPairs)
+
+        let decoded = ZkSystemSpec.fromCbor(rawCbor)
+        @Assert(decoded.system, "bls12-381")
+        @Assert(decoded.zkSystemId, "bls12-381")
+        @Assert(decoded.params.size, Int64(0))
+    }
+
+    @TestCase
+    func specBytewiseRoundTrip(): Unit {
+        let params: ZkParams = ArrayList<(String, ZkParam)>()
+        params.add(("n", ZkParam.IntParam(128)))
+        let exts: ArrayList<(String, CborValue)> = ArrayList<(String, CborValue)>()
+        let spec = ZkSystemSpec("test-system", "test-system", params, exts)
+        let bytes1 = spec.encode()
+        let decoded = ZkSystemSpec.decode(bytes1)
+        let bytes2 = decoded.encode()
+        @Assert(bytesEqualZkp(bytes1, bytes2))
+    }
+
+    // HI-MDOC-003: when zkSystemId differs from system, toCbor must serialize
+    // the "zkSystemId" key so that it survives a round-trip via fromCbor.
+    @TestCase
+    func zkSystemIdDistinctFromSystemSurvivesRoundTrip(): Unit {
+        let params: ZkParams = ArrayList<(String, ZkParam)>()
+        params.add(("level", ZkParam.IntParam(2)))
+        let exts: ArrayList<(String, CborValue)> = ArrayList<(String, CborValue)>()
+        // zkSystemId ("groth16-v2") differs from system ("groth16")
+        let spec = ZkSystemSpec("groth16-v2", "groth16", params, exts)
+
+        let bytes = spec.encode()
+        let decoded = ZkSystemSpec.decode(bytes)
+
+        // Both fields must survive the round-trip
+        @Assert(decoded.system, "groth16")
+        @Assert(decoded.zkSystemId, "groth16-v2")
+    }
+
+    @TestCase
+    func zkSystemIdEqualToSystemOmittedInCbor(): Unit {
+        // When zkSystemId == system the key is omitted; fromCbor falls back to system value
+        let params: ZkParams = ArrayList<(String, ZkParam)>()
+        let exts: ArrayList<(String, CborValue)> = ArrayList<(String, CborValue)>()
+        let spec = ZkSystemSpec("bls12-381", "bls12-381", params, exts)
+
+        let bytes = spec.encode()
+        let decoded = ZkSystemSpec.decode(bytes)
+
+        @Assert(decoded.system, "bls12-381")
+        @Assert(decoded.zkSystemId, "bls12-381")
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 3 — ZkSystemRepository: register / lookup / not-found         */
+/* ------------------------------------------------------------------ */
+
+@Test
+public class ZkSystemRepositoryTest {
+
+    @TestCase
+    func registerAndLookup(): Unit {
+        let specs: ArrayList<ZkSystemSpec> = ArrayList<ZkSystemSpec>()
+        let p1: ZkParams = ArrayList<(String, ZkParam)>()
+        p1.add(("k", ZkParam.IntParam(1)))
+        let exts1: ArrayList<(String, CborValue)> = ArrayList<(String, CborValue)>()
+        specs.add(ZkSystemSpec("sys-a", "sys-a", p1, exts1))
+        let fakeSystem = FakeZkSystem("sys-a", specs)
+
+        var repo = ZkSystemRepository()
+        repo.add(fakeSystem)
+
+        @Assert(repo.size(), Int64(1))
+
+        let found = repo.lookup("sys-a")
+        @Assert(found.isSome())
+        match (found) {
+            case Some(s) => @Assert(s.name, "sys-a")
+            case None => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func lookupNotFound(): Unit {
+        var repo = ZkSystemRepository()
+        let result = repo.lookup("nonexistent")
+        @Assert(result.isNone())
+    }
+
+    @TestCase
+    func getAllZkSystemSpecs(): Unit {
+        let specs1: ArrayList<ZkSystemSpec> = ArrayList<ZkSystemSpec>()
+        let p1: ZkParams = ArrayList<(String, ZkParam)>()
+        let exts1: ArrayList<(String, CborValue)> = ArrayList<(String, CborValue)>()
+        specs1.add(ZkSystemSpec("s1", "s1", p1, exts1))
+        let sys1 = FakeZkSystem("system-one", specs1)
+
+        let specs2: ArrayList<ZkSystemSpec> = ArrayList<ZkSystemSpec>()
+        let p2: ZkParams = ArrayList<(String, ZkParam)>()
+        let exts2: ArrayList<(String, CborValue)> = ArrayList<(String, CborValue)>()
+        specs2.add(ZkSystemSpec("s2a", "s2", p2, exts2))
+        let p3: ZkParams = ArrayList<(String, ZkParam)>()
+        let exts3: ArrayList<(String, CborValue)> = ArrayList<(String, CborValue)>()
+        specs2.add(ZkSystemSpec("s2b", "s2", p3, exts3))
+        let sys2 = FakeZkSystem("system-two", specs2)
+
+        var repo = ZkSystemRepository()
+        repo.add(sys1)
+        repo.add(sys2)
+
+        let allSpecs = repo.getAllZkSystemSpecs()
+        @Assert(allSpecs.size, Int64(3))
+    }
+
+    @TestCase
+    func multipleSystemsLookupByName(): Unit {
+        let specs1: ArrayList<ZkSystemSpec> = ArrayList<ZkSystemSpec>()
+        let specs2: ArrayList<ZkSystemSpec> = ArrayList<ZkSystemSpec>()
+        let sysA = FakeZkSystem("alpha", specs1)
+        let sysB = FakeZkSystem("beta", specs2)
+
+        var repo = ZkSystemRepository()
+        repo.add(sysA)
+        repo.add(sysB)
+
+        let foundA = repo.lookup("alpha")
+        let foundB = repo.lookup("beta")
+        let foundC = repo.lookup("gamma")
+
+        @Assert(foundA.isSome())
+        @Assert(foundB.isSome())
+        @Assert(foundC.isNone())
+        match (foundA) {
+            case Some(s) => @Assert(s.name, "alpha")
+            case None => @Assert(false)
+        }
+        match (foundB) {
+            case Some(s) => @Assert(s.name, "beta")
+            case None => @Assert(false)
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Added coverage: ZkParam.boolValue, ZkSystemRepository.ofSystems    */
+/* ------------------------------------------------------------------ */
+
+@Test
+public class ZkParamBoolValueTest {
+
+    /* boolValue returns Some(v) for a BoolParam, None for other variants. */
+    @TestCase
+    func boolValueSome(): Unit {
+        let pTrue = ZkParam.BoolParam(true)
+        let pFalse = ZkParam.BoolParam(false)
+        match (pTrue.boolValue()) {
+            case Some(v) => @Assert(v)
+            case None => @Assert(false)
+        }
+        match (pFalse.boolValue()) {
+            case Some(v) => @Assert(!v)
+            case None => @Assert(false)
+        }
+    }
+
+    @TestCase
+    func boolValueNoneForOtherVariants(): Unit {
+        @Assert(ZkParam.IntParam(7).boolValue().isNone())
+        @Assert(ZkParam.StringParam("x").boolValue().isNone())
+    }
+}
+
+@Test
+public class ZkSystemRepositoryOfSystemsTest {
+
+    /* ofSystems pre-populates the repository with the supplied systems. */
+    @TestCase
+    func ofSystemsPopulates(): Unit {
+        let specsA: ArrayList<ZkSystemSpec> = ArrayList<ZkSystemSpec>()
+        let pA: ZkParams = ArrayList<(String, ZkParam)>()
+        let extsA: ArrayList<(String, CborValue)> = ArrayList<(String, CborValue)>()
+        specsA.add(ZkSystemSpec("alpha", "alpha", pA, extsA))
+
+        let initial: ArrayList<ZkSystemProtocol> = ArrayList<ZkSystemProtocol>()
+        initial.add(FakeZkSystem("alpha", specsA))
+        initial.add(FakeZkSystem("beta", ArrayList<ZkSystemSpec>()))
+
+        let repo = ZkSystemRepository.ofSystems(initial)
+        @Assert(repo.size(), Int64(2))
+        @Assert(repo.lookup("alpha").isSome())
+        @Assert(repo.lookup("beta").isSome())
+        @Assert(repo.lookup("missing").isNone())
+    }
+
+    /* ofSystems with an empty list yields an empty repository. */
+    @TestCase
+    func ofSystemsEmpty(): Unit {
+        let repo = ZkSystemRepository.ofSystems(ArrayList<ZkSystemProtocol>())
+        @Assert(repo.size(), Int64(0))
+    }
+}

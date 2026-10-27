@@ -1,0 +1,9 @@
+{
+  "module": {
+    "name": "eudi_cjmdoc_data_model",
+    "type": "har",
+    "deviceTypes": [
+      "default"
+    ]
+  }
+}

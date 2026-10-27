@@ -1,0 +1,30 @@
+/*
+ * mdoc_demo_test.cj
+ *
+ * Unit tests for app_shell feature — fc_app_shell_test_panel.
+ *
+ * done_when: runMdocDemo() returns a string starting with "OK:" and
+ *            containing "roundtrip=PASS".
+ */
+package ohos_app_cangjie_eudi_cjmdoc_data_model_local_test
+
+import std.unittest.*
+import std.unittest.testmacro.*
+
+import ohos_app_cangjie_eudi_cjmdoc_data_model.runMdocDemo
+
+@Test
+public class MdocDemoTest {
+
+    @TestCase
+    func runMdocDemoReturnsOk(): Unit {
+        let result = runMdocDemo()
+        @Assert(result.startsWith("OK:"))
+    }
+
+    @TestCase
+    func runMdocDemoContainsRoundtripPass(): Unit {
+        let result = runMdocDemo()
+        @Assert(result.contains("roundtrip=PASS"))
+    }
+}

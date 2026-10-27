@@ -1,0 +1,544 @@
+/*
+ * mdoc_securearea_test.cj
+ *
+ * Unit tests for mdoc_securearea feature (fc_mdoc_securearea_api):
+ *   1. Registry: register / dispatch / unregister (done_when 1)
+ *   2. Config types CBOR round-trip: KeyOptions, CredentialOptions,
+ *      CredentialsUsageCounts, KeyBatchInfo, DocKeyInfo (done_when 2)
+ */
+package ohos_app_cangjie_eudi_cjmdoc_data_model_local_test
+
+import std.unittest.*
+import std.unittest.testmacro.*
+import std.collection.HashMap
+
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.securearea.CoseEcCurve
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.securearea.SigningAlgorithm
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.securearea.KeyPurpose
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.securearea.KeyAccessProtection
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.securearea.KeyAccessControl
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.securearea.KeyOptions
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.securearea.CredentialPolicy
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.securearea.CredentialOptions
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.securearea.CredentialsUsageCounts
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.securearea.KeyBatchInfo
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.securearea.DocKeyInfo
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.securearea.SecureAreaError
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.securearea.SecureArea
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.securearea.SecureKeyStorage
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.securearea.SecureAreaRegistry
+
+/* ==================================================================== */
+/* TestSecureArea — minimal implementation for registry dispatch tests  */
+/* ==================================================================== */
+
+/**
+ * Minimal SecureArea implementation for registry tests.
+ * Implements all interface methods; no real crypto is performed.
+ */
+class TestSecureArea <: SecureArea {
+    private let areaName: String
+
+    public init(name: String) {
+        this.areaName = name
+    }
+
+    public func getName(): String {
+        return this.areaName
+    }
+
+    public func getDefaultEcCurve(): CoseEcCurve {
+        return CoseEcCurve.P256
+    }
+
+    public func getSupportedEcCurves(): Array<CoseEcCurve> {
+        return [CoseEcCurve.P256, CoseEcCurve.P384, CoseEcCurve.P521]
+    }
+
+    public func getStorage(): SecureKeyStorage {
+        throw SecureAreaError("TestSecureArea: no storage")
+    }
+
+    public func createKeyBatch(id: String, credentialOptions: CredentialOptions, keyOptions: ?KeyOptions): KeyBatchInfo {
+        let sz = credentialOptions.batchSize
+        let counts: Array<Int64> = Array<Int64>(sz, {_ => Int64(0)})
+        return KeyBatchInfo(
+            Some(this.areaName),
+            CoseEcCurve.P256,
+            counts,
+            credentialOptions.credentialPolicy,
+            Some(KeyPurpose.allCases()),
+            None
+        )
+    }
+
+    public func getPublicKeyBytes(id: String, index: Int64, curve: CoseEcCurve): Array<UInt8> {
+        return []
+    }
+
+    public func unlockKey(id: String): ?Array<UInt8> {
+        return None
+    }
+
+    public func deleteKeyBatch(id: String, startIndex: Int64, batchSize: Int64): Unit {
+    }
+
+    public func deleteKeyInfo(id: String): Unit {
+    }
+
+    public func signature(id: String, index: Int64, algorithm: SigningAlgorithm, dataToSign: Array<UInt8>, unlockData: ?Array<UInt8>): Array<UInt8> {
+        return []
+    }
+
+    public func keyAgreement(id: String, index: Int64, publicKeyBytes: Array<UInt8>, unlockData: ?Array<UInt8>): Array<UInt8> {
+        return []
+    }
+
+    public func getKeyBatchInfo(id: String): KeyBatchInfo {
+        throw SecureAreaError("TestSecureArea: no key info")
+    }
+
+    public func defaultSigningAlgorithm(ecCurve: CoseEcCurve): SigningAlgorithm {
+        return ecCurve.defaultSigningAlgorithm()
+    }
+}
+
+/* ==================================================================== */
+/* Registry tests (done_when 1)                                         */
+/* ==================================================================== */
+
+@Test
+class SecureAreaRegistryTest {
+
+    /**
+     * Test: register a SecureArea, retrieve it by name, unregister it.
+     * Verifies the three main Registry operations.
+     */
+    /**
+     * The library exposes SecureAreaRegistry only as a process-wide singleton
+     * (private init). To keep per-test isolation against that shared instance,
+     * remove every currently-registered area before each test using public API.
+     */
+    private static func clearRegistry(registry: SecureAreaRegistry): Unit {
+        for (n in registry.names()) {
+            registry.unregister(n)
+        }
+    }
+
+    @TestCase
+    func testRegisterAndDispatch() {
+        let registry = SecureAreaRegistry.shared
+        clearRegistry(registry)
+        let area = TestSecureArea("TestArea")
+        registry.register(area)
+
+        let retrieved = registry.get(Some("TestArea"))
+        @Assert(retrieved.getName(), "TestArea")
+
+        let names = registry.names()
+        @Assert(names.size, 1)
+
+        registry.unregister("TestArea")
+        let namesAfter = registry.names()
+        @Assert(namesAfter.size, 0)
+    }
+
+    /**
+     * Test: multiple registrations; fallback to default ordering.
+     */
+    @TestCase
+    func testDefaultFallbackOrder() {
+        let registry = SecureAreaRegistry.shared
+        clearRegistry(registry)
+        let softwareArea = TestSecureArea("Software")
+        registry.register(softwareArea)
+
+        let defaultArea = registry.defaultSecurityArea()
+        @Assert(defaultArea.getName(), "Software")
+    }
+
+    /**
+     * Test: get(name: None) falls back to default.
+     */
+    @TestCase
+    func testGetWithNone() {
+        let registry = SecureAreaRegistry.shared
+        clearRegistry(registry)
+        let area = TestSecureArea("Alpha")
+        registry.register(area)
+
+        let fetched = registry.get(None)
+        @Assert(fetched.getName(), "Alpha")
+    }
+
+    /**
+     * Test: shared singleton is accessible and yields consistent reference.
+     * Two accesses to SecureAreaRegistry.shared return the same instance.
+     */
+    @TestCase
+    func testSharedSingleton() {
+        // No reference-identity operator in this Cangjie toolchain; prove the two
+        // accesses are the same instance by observing shared mutable state: a
+        // registration done through r1 must be visible through r2.
+        let r1 = SecureAreaRegistry.shared
+        let r2 = SecureAreaRegistry.shared
+        r1.register(TestSecureArea("SharedProbe"))
+        let seenByR2 = r2.get(Some("SharedProbe"))
+        @Assert(seenByR2.getName(), "SharedProbe")
+        r1.unregister("SharedProbe")
+        var stillThere = false
+        for (n in r2.names()) {
+            if (n == "SharedProbe") {
+                stillThere = true
+            }
+        }
+        @Assert(stillThere, false)
+    }
+
+    /**
+     * Test: getByDeviceName returns Some for a registered area, None otherwise.
+     */
+    @TestCase
+    func testGetByDeviceName() {
+        let registry = SecureAreaRegistry.shared
+        clearRegistry(registry)
+        registry.register(TestSecureArea("SecureEnclave"))
+
+        match (registry.getByDeviceName("SecureEnclave")) {
+            case Some(a) => @Assert(a.getName(), "SecureEnclave")
+            case None => @Assert(false)
+        }
+        @Assert(registry.getByDeviceName("Nonexistent").isNone())
+        registry.unregister("SecureEnclave")
+    }
+
+    /**
+     * Test: values() returns every registered SecureArea instance.
+     */
+    @TestCase
+    func testValues() {
+        let registry = SecureAreaRegistry.shared
+        clearRegistry(registry)
+        registry.register(TestSecureArea("Software"))
+        registry.register(TestSecureArea("SecureEnclave"))
+
+        let all = registry.values()
+        @Assert(all.size, 2)
+        var sawSoftware = false
+        var sawEnclave = false
+        for (a in all) {
+            if (a.getName() == "Software") { sawSoftware = true }
+            if (a.getName() == "SecureEnclave") { sawEnclave = true }
+        }
+        @Assert(sawSoftware)
+        @Assert(sawEnclave)
+        clearRegistry(registry)
+    }
+}
+
+/* ==================================================================== */
+/* Added coverage: CoseEcCurve.bitSize/secgName, SigningAlgorithm.order, */
+/* KeyAccessProtection round-trip, KeyAccessControl union/contains       */
+/* ==================================================================== */
+
+@Test
+class CoseEcCurveAttributesTest {
+
+    /* bitSize for representative curves. */
+    @TestCase
+    func bitSizeValues() {
+        @Expect(CoseEcCurve.P256.bitSize(), Int64(256))
+        @Expect(CoseEcCurve.P384.bitSize(), Int64(384))
+        @Expect(CoseEcCurve.P521.bitSize(), Int64(521))
+        @Expect(CoseEcCurve.BRAINPOOLP320R1.bitSize(), Int64(320))
+        @Expect(CoseEcCurve.BRAINPOOLP512R1.bitSize(), Int64(512))
+        @Expect(CoseEcCurve.X448.bitSize(), Int64(448))
+        @Expect(CoseEcCurve.ED25519.bitSize(), Int64(256))
+    }
+
+    /* secgName for representative curves. */
+    @TestCase
+    func secgNameValues() {
+        @Expect(CoseEcCurve.P256.secgName(), "secp256r1")
+        @Expect(CoseEcCurve.P384.secgName(), "secp384r1")
+        @Expect(CoseEcCurve.P521.secgName(), "secp521r1")
+        @Expect(CoseEcCurve.BRAINPOOLP256R1.secgName(), "brainpoolP256r1")
+        @Expect(CoseEcCurve.ED448.secgName(), "ed448")
+        @Expect(CoseEcCurve.X25519.secgName(), "x25519")
+    }
+}
+
+@Test
+class SigningAlgorithmOrderTest {
+
+    /* order() ranks algorithms by strength: UNSET < ES256 < ES384 < ES512 < EDDSA. */
+    @TestCase
+    func orderRanking() {
+        @Expect(SigningAlgorithm.UNSET.order(), Int64(0))
+        @Expect(SigningAlgorithm.ES256.order(), Int64(1))
+        @Expect(SigningAlgorithm.ES384.order(), Int64(2))
+        @Expect(SigningAlgorithm.ES512.order(), Int64(3))
+        @Expect(SigningAlgorithm.EDDSA.order(), Int64(4))
+        @Assert(SigningAlgorithm.ES256.order() < SigningAlgorithm.ES512.order())
+    }
+}
+
+@Test
+class KeyAccessProtectionTest {
+
+    /* rawValue/fromRaw round-trip for every protection level. */
+    @TestCase
+    func rawValueRoundTrip() {
+        let all: Array<KeyAccessProtection> = [
+            KeyAccessProtection.WhenUnlocked,
+            KeyAccessProtection.AfterFirstUnlock,
+            KeyAccessProtection.WhenUnlockedThisDeviceOnly,
+            KeyAccessProtection.AfterFirstUnlockThisDeviceOnly,
+            KeyAccessProtection.WhenPasscodeSetThisDeviceOnly
+        ]
+        for (p in all) {
+            let back = KeyAccessProtection.fromRaw(p.rawValue())
+            @Expect(back.rawValue(), p.rawValue())
+        }
+        @Expect(KeyAccessProtection.WhenUnlocked.rawValue(), Int64(0))
+        @Expect(KeyAccessProtection.WhenPasscodeSetThisDeviceOnly.rawValue(), Int64(4))
+    }
+
+    /* fromRaw on an unknown integer throws SecureAreaError. */
+    @TestCase
+    func fromRawUnknownThrows() {
+        var threw = false
+        try {
+            KeyAccessProtection.fromRaw(99)
+        } catch (_: SecureAreaError) {
+            threw = true
+        }
+        @Assert(threw)
+    }
+}
+
+@Test
+class KeyAccessControlTest {
+
+    /* union combines bitflags; contains tests membership. */
+    @TestCase
+    func unionAndContains() {
+        let up = KeyAccessControl.requireUserPresence          // bit 0 (1)
+        let pw = KeyAccessControl.requireApplicationPassword   // bit 1 (2)
+
+        let combined = up.union(pw)
+        @Expect(combined.rawValue, Int64(3))
+        @Assert(combined.contains(up))
+        @Assert(combined.contains(pw))
+
+        // A single-flag value does not contain the other flag.
+        @Assert(!up.contains(pw))
+    }
+
+    /* union is idempotent for identical flags. */
+    @TestCase
+    func unionIdempotent() {
+        let up = KeyAccessControl.requireUserPresence
+        let twice = up.union(up)
+        @Expect(twice.rawValue, Int64(1))
+    }
+}
+
+/* ==================================================================== */
+/* Config type CBOR round-trip tests (done_when 2)                      */
+/* ==================================================================== */
+
+@Test
+class SecureAreaConfigRoundTripTest {
+
+    /**
+     * CoseEcCurve: rawValue / fromRaw round-trip for full IANA set.
+     */
+    @TestCase
+    func testCoseEcCurveRoundTrip() {
+        let curves: Array<CoseEcCurve> = [
+            CoseEcCurve.P256, CoseEcCurve.P384, CoseEcCurve.P521,
+            CoseEcCurve.X25519, CoseEcCurve.X448,
+            CoseEcCurve.ED25519, CoseEcCurve.ED448,
+            CoseEcCurve.BRAINPOOLP256R1, CoseEcCurve.BRAINPOOLP320R1,
+            CoseEcCurve.BRAINPOOLP384R1, CoseEcCurve.BRAINPOOLP512R1
+        ]
+        for (curve in curves) {
+            let raw = curve.rawValue()
+            let decoded = CoseEcCurve.fromRaw(raw)
+            @Assert(decoded.rawValue(), raw)
+        }
+    }
+
+    /**
+     * CoseEcCurve: jwkName / fromJwkName round-trip.
+     */
+    @TestCase
+    func testCoseEcCurveJwkRoundTrip() {
+        let curves: Array<CoseEcCurve> = [
+            CoseEcCurve.P256, CoseEcCurve.P384, CoseEcCurve.P521,
+            CoseEcCurve.ED25519, CoseEcCurve.ED448,
+            CoseEcCurve.X25519, CoseEcCurve.X448
+        ]
+        for (curve in curves) {
+            let name = curve.jwkName()
+            let decoded = CoseEcCurve.fromJwkName(name)
+            @Assert(decoded.rawValue(), curve.rawValue())
+        }
+    }
+
+    /**
+     * KeyOptions CBOR round-trip: defaults instance.
+     */
+    @TestCase
+    func testKeyOptionsDefaultsRoundTrip() {
+        let opts = KeyOptions.defaults()
+        let bytes = opts.toBytes()
+        let decoded = KeyOptions.fromBytes(bytes)
+        @Assert(decoded.curve.rawValue(), CoseEcCurve.P256.rawValue())
+        @Assert(decoded.secureAreaName.isNone(), true)
+    }
+
+    /**
+     * KeyOptions CBOR round-trip: fully-populated instance.
+     */
+    @TestCase
+    func testKeyOptionsFullRoundTrip() {
+        let opts = KeyOptions(
+            CoseEcCurve.P384,
+            Some("TestArea"),
+            None,
+            None,
+            Some([KeyPurpose.Signing]),
+            Some([UInt8(0xDE), UInt8(0xAD)])
+        )
+        let bytes = opts.toBytes()
+        let decoded = KeyOptions.fromBytes(bytes)
+        @Assert(decoded.curve.rawValue(), CoseEcCurve.P384.rawValue())
+        match (decoded.secureAreaName) {
+            case Some(n) => @Assert(n, "TestArea")
+            case None => @Assert(false)
+        }
+        match (decoded.keyPurposes) {
+            case Some(ps) =>
+                @Assert(ps.size, 1)
+                @Assert(ps[0].rawValue(), "Signing")
+            case None => @Assert(false)
+        }
+        match (decoded.additionalOptions) {
+            case Some(b) =>
+                @Assert(b.size, 2)
+                @Assert(b[0], UInt8(0xDE))
+                @Assert(b[1], UInt8(0xAD))
+            case None => @Assert(false)
+        }
+    }
+
+    /**
+     * CredentialOptions CBOR round-trip.
+     */
+    @TestCase
+    func testCredentialOptionsRoundTrip() {
+        let opts = CredentialOptions(CredentialPolicy.RotateUse, Int64(5))
+        let bytes = opts.toBytes()
+        let decoded = CredentialOptions.fromBytes(bytes)
+        @Assert(decoded.credentialPolicy.rawValue(), "rotateUse")
+        @Assert(decoded.batchSize, Int64(5))
+    }
+
+    /**
+     * CredentialsUsageCounts CBOR round-trip.
+     */
+    @TestCase
+    func testCredentialsUsageCountsRoundTrip() {
+        let counts = CredentialsUsageCounts(Int64(10), Int64(7))
+        let bytes = counts.toBytes()
+        let decoded = CredentialsUsageCounts.fromBytes(bytes)
+        @Assert(decoded.total, Int64(10))
+        @Assert(decoded.remaining, Int64(7))
+        @Assert(decoded.used(), Int64(3))
+    }
+
+    /**
+     * KeyBatchInfo CBOR round-trip: basic fields.
+     */
+    @TestCase
+    func testKeyBatchInfoRoundTrip() {
+        let usedCounts: Array<Int64> = [Int64(0), Int64(1), Int64(0)]
+        let kbi = KeyBatchInfo(
+            Some("Software"),
+            CoseEcCurve.P256,
+            usedCounts,
+            CredentialPolicy.OneTimeUse,
+            Some(KeyPurpose.allCases()),
+            None
+        )
+        let bytes = kbi.toBytes()
+        let decoded = KeyBatchInfo.fromBytes(bytes)
+        @Assert(decoded.crv.rawValue(), CoseEcCurve.P256.rawValue())
+        @Assert(decoded.credentialPolicy.rawValue(), "oneTimeUse")
+        @Assert(decoded.batchSize(), Int64(3))
+        @Assert(decoded.usedCounts[1], Int64(1))
+        match (decoded.secureAreaName) {
+            case Some(n) => @Assert(n, "Software")
+            case None => @Assert(false)
+        }
+    }
+
+    /**
+     * KeyBatchInfo.afterUse increments usage counter correctly.
+     */
+    @TestCase
+    func testKeyBatchInfoAfterUse() {
+        let usedCounts: Array<Int64> = [Int64(0), Int64(0), Int64(0)]
+        let kbi = KeyBatchInfo(
+            None,
+            CoseEcCurve.P256,
+            usedCounts,
+            CredentialPolicy.RotateUse,
+            None,
+            None
+        )
+        let updated = KeyBatchInfo.afterUse(kbi, Int64(1))
+        @Assert(updated.usedCounts[0], Int64(0))
+        @Assert(updated.usedCounts[1], Int64(1))
+        @Assert(updated.usedCounts[2], Int64(0))
+    }
+
+    /**
+     * KeyBatchInfo.findIndexToUse returns minimum-usage index.
+     */
+    @TestCase
+    func testFindIndexToUse() {
+        let usedCounts: Array<Int64> = [Int64(2), Int64(0), Int64(1)]
+        let kbi = KeyBatchInfo(
+            None,
+            CoseEcCurve.P256,
+            usedCounts,
+            CredentialPolicy.RotateUse,
+            None,
+            None
+        )
+        let idx = kbi.findIndexToUse()
+        match (idx) {
+            case Some(i) => @Assert(i, Int64(1))
+            case None => @Assert(false)
+        }
+    }
+
+    /**
+     * DocKeyInfo CBOR round-trip.
+     */
+    @TestCase
+    func testDocKeyInfoRoundTrip() {
+        let dki = DocKeyInfo(Some("HUKS"), Int64(3), CredentialPolicy.RotateUse)
+        let bytes = dki.toBytes()
+        let decoded = DocKeyInfo.fromBytes(bytes)
+        @Assert(decoded.batchSize, Int64(3))
+        @Assert(decoded.credentialPolicy.rawValue(), "rotateUse")
+        match (decoded.secureAreaName) {
+            case Some(n) => @Assert(n, "HUKS")
+            case None => @Assert(false)
+        }
+    }
+}
